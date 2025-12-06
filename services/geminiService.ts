@@ -1,6 +1,7 @@
 import { SubtitleSegment, WordDefinition, LocalLLMConfig } from "../types";
 import { lookupWord, speakText } from "../utils/dictionary";
 import { GoogleGenAI, Type } from "@google/genai";
+import { extractAudioAsWav } from "./converterService";
 
 // --- OFFLINE WORKER CODE ---
 const WORKER_CODE = `
@@ -42,7 +43,7 @@ self.onmessage = async (event) => {
     }
 
     if (message.type === 'generate') {
-        const { audio, model } = message.data;
+        const { audio, model, jobId } = message.data;
         // Whisper expects 16kHz audio
         const SAMPLE_RATE = 16000;
         // Process in 30-second chunks (standard Whisper window)
@@ -82,16 +83,16 @@ self.onmessage = async (event) => {
                     };
                 });
 
-                // Emit partial results immediately
-                self.postMessage({ type: 'partial', data: adjustedChunks });
+                // Emit partial results immediately with jobId
+                self.postMessage({ type: 'partial', data: adjustedChunks, jobId });
 
                 offsetSamples += CHUNK_SIZE;
             }
 
-            self.postMessage({ type: 'complete' });
+            self.postMessage({ type: 'complete', jobId });
 
         } catch (error) {
-            self.postMessage({ type: 'error', data: error.message });
+            self.postMessage({ type: 'error', data: error.message, jobId });
         }
     }
 };
@@ -102,6 +103,7 @@ let worker: Worker | null = null;
 let onSubtitleProgressCallback: ((segments: SubtitleSegment[]) => void) | null = null;
 let onLoadProgressCallback: ((data: any) => void) | null = null;
 let accumulatedSegments: SubtitleSegment[] = [];
+let activeJobId = 0; // Track the current generation job
 
 const initWorker = () => {
   if (!worker) {
@@ -110,8 +112,14 @@ const initWorker = () => {
     worker = new Worker(workerUrl, { type: 'module' });
     
     worker.onmessage = (event) => {
-      const { type, data } = event.data;
+      const { type, data, jobId } = event.data;
       
+      // If this message belongs to a specific job (generation), check if it's still active
+      if (typeof jobId === 'number' && jobId !== activeJobId) {
+          // Ignore stale messages from previous runs
+          return;
+      }
+
       if (type === 'progress') {
           if (onLoadProgressCallback) onLoadProgressCallback(data);
       } 
@@ -142,6 +150,7 @@ const initWorker = () => {
       else if (type === 'error') {
         console.error("Worker Error:", data);
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'error', error: data });
+        // Only show alert if it's a general error, not a cancelled job error
         if (!data.file && typeof data === 'string') alert("Offline AI Error: " + data); 
       }
     };
@@ -151,18 +160,36 @@ const initWorker = () => {
 
 // --- AUDIO UTILITIES ---
 const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float32Array | string> => {
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-    const arrayBuffer = await videoFile.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-    if (forOffline) {
-        // Offline needs raw Float32 data
-        return audioBuffer.getChannelData(0);
-    } else {
-        // Online needs Base64 WAV
-        const pcmData = audioBuffer.getChannelData(0);
-        const wavBuffer = encodeWAV(pcmData, 16000);
-        return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
+    try {
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        const arrayBuffer = await videoFile.arrayBuffer();
+        
+        // Try native decoding first
+        try {
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            if (forOffline) {
+                return audioBuffer.getChannelData(0);
+            } else {
+                const pcmData = audioBuffer.getChannelData(0);
+                const wavBuffer = encodeWAV(pcmData, 16000);
+                return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
+            }
+        } catch (decodeError) {
+            console.warn("Native decoding failed, trying FFmpeg fallback...", decodeError);
+            
+            // Fallback: Use FFmpeg to extract audio
+            const pcmData = await extractAudioAsWav(videoFile);
+            
+            if (forOffline) {
+                return pcmData;
+            } else {
+                const wavBuffer = encodeWAV(pcmData, 16000);
+                return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
+            }
+        }
+    } catch (e: any) {
+        console.error("All audio decoding methods failed:", e);
+        throw new Error(e.message || "Unable to decode audio data. The file format might be corrupted or unsupported.");
     }
 };
 
@@ -210,7 +237,13 @@ function blobToBase64(blob: Blob): Promise<string> {
 // --- ONLINE MODE IMPLEMENTATION ---
 let aiInstance: GoogleGenAI | null = null;
 
-const getAI = () => {
+const getAI = (apiKey?: string) => {
+    // If a specific key is provided (from UI settings), use it immediately
+    if (apiKey) {
+        return new GoogleGenAI({ apiKey });
+    }
+
+    // Fallback/Legacy logic
     if (!aiInstance) {
         // Lazily access process.env to prevent ReferenceError in browser/offline modes
         // @ts-ignore
@@ -221,10 +254,10 @@ const getAI = () => {
     return aiInstance;
 };
 
-const generateSubtitlesOnline = async (file: File): Promise<SubtitleSegment[]> => {
+const generateSubtitlesOnline = async (file: File, apiKey?: string): Promise<SubtitleSegment[]> => {
     const base64Audio = await getAudioData(file, false) as string;
     
-    const response = await getAI().models.generateContent({
+    const response = await getAI(apiKey).models.generateContent({
         model: 'gemini-2.5-flash',
         contents: {
             parts: [
@@ -259,8 +292,8 @@ const generateSubtitlesOnline = async (file: File): Promise<SubtitleSegment[]> =
     return [];
 };
 
-const getWordDefinitionOnline = async (word: string, context: string): Promise<WordDefinition> => {
-    const response = await getAI().models.generateContent({
+const getWordDefinitionOnline = async (word: string, context: string, apiKey?: string): Promise<WordDefinition> => {
+    const response = await getAI(apiKey).models.generateContent({
         model: 'gemini-2.5-flash',
         contents: `Define the word "${word}" based on this context: "${context}".
                    Return JSON with: word, phonetic (IPA), partOfSpeech, meaning, usage (short usage in context), example (a new example sentence).`,
@@ -343,7 +376,8 @@ export const generateSubtitles = async (
     videoFile: File, 
     onProgress: (segments: SubtitleSegment[]) => void,
     isOffline: boolean = true,
-    modelId: string = 'Xenova/whisper-tiny'
+    modelId: string = 'Xenova/whisper-tiny',
+    apiKey?: string
 ): Promise<SubtitleSegment[]> => {
     
     if (isOffline) {
@@ -351,12 +385,20 @@ export const generateSubtitles = async (
         accumulatedSegments = [];
         onSubtitleProgressCallback = onProgress;
         
+        // Start new job ID
+        activeJobId++;
+        const currentJobId = activeJobId;
+        
         const w = initWorker();
         const audioData = await getAudioData(videoFile, true) as Float32Array;
-        w.postMessage({ type: 'generate', data: { audio: audioData, model: modelId } });
+        
+        // Check if job is still active after audio extraction (which can take time)
+        if (currentJobId !== activeJobId) return [];
+
+        w.postMessage({ type: 'generate', data: { audio: audioData, model: modelId, jobId: currentJobId } });
         return []; // Progress handled via callback
     } else {
-        const segments = await generateSubtitlesOnline(videoFile);
+        const segments = await generateSubtitlesOnline(videoFile, apiKey);
         onProgress(segments);
         return segments;
     }
@@ -366,7 +408,8 @@ export const getWordDefinition = async (
     word: string, 
     contextSentence: string,
     isOffline: boolean = true,
-    localLLMConfig?: LocalLLMConfig
+    localLLMConfig?: LocalLLMConfig,
+    apiKey?: string
 ): Promise<WordDefinition> => {
     if (isOffline) {
         if (localLLMConfig?.enabled && localLLMConfig.endpoint && localLLMConfig.model) {
@@ -379,7 +422,7 @@ export const getWordDefinition = async (
         }
         return lookupWord(word, contextSentence);
     } else {
-        return getWordDefinitionOnline(word, contextSentence);
+        return getWordDefinitionOnline(word, contextSentence, apiKey);
     }
 };
 

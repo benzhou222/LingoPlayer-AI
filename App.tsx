@@ -1,14 +1,21 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check } from 'lucide-react';
-import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig } from './types';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server } from 'lucide-react';
+import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig } from './types';
 import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
 import { WordDefinitionPanel } from './components/WordDefinitionPanel';
+import { extractAudioAsWav } from './services/converterService';
 
 const OFFLINE_MODELS = [
-    { id: 'Xenova/whisper-tiny', name: 'Tiny (Fastest, ~40MB)' },
-    { id: 'Xenova/whisper-base', name: 'Base (Balanced, ~75MB)' },
-    { id: 'Xenova/whisper-small', name: 'Small (High Quality, ~250MB)' },
+    { id: 'Xenova/whisper-tiny', name: 'Tiny (Multilingual, ~40MB)' },
+    { id: 'Xenova/whisper-tiny.en', name: 'Tiny English (Fastest, ~40MB)' },
+    { id: 'Xenova/whisper-base', name: 'Base (Multilingual, ~75MB)' },
+    { id: 'Xenova/whisper-base.en', name: 'Base English (Balanced, ~75MB)' },
+    { id: 'Xenova/whisper-small', name: 'Small (Multilingual, ~250MB)' },
+    { id: 'Xenova/whisper-small.en', name: 'Small English (High Quality, ~250MB)' },
+    { id: 'Xenova/whisper-medium', name: 'Medium (Very High Quality, ~1.5GB)' },
+    { id: 'Xenova/whisper-medium.en', name: 'Medium English (Very High Quality, ~1.5GB)' },
+    { id: 'Xenova/distil-whisper-large-v3', name: 'Distil-Large V3 (Best Accuracy, ~1.2GB)' },
 ];
 
 const formatTime = (seconds: number) => {
@@ -44,7 +51,22 @@ export default function App() {
   const [loadingWord, setLoadingWord] = useState(false);
   const [selectedWord, setSelectedWord] = useState<WordDefinition | null>(null);
   const [showVocabSidebar, setShowVocabSidebar] = useState(true);
+  const [showModelAlert, setShowModelAlert] = useState(false); // Alert modal state
 
+  // Layout Resizing State
+  const [leftPanelWidth, setLeftPanelWidth] = useState(320);
+  const [rightPanelWidth, setRightPanelWidth] = useState(320);
+  const [videoHeight, setVideoHeight] = useState(450); // Default video height
+  const [subtitleHeight, setSubtitleHeight] = useState(200); // Default subtitle height
+  
+  const isResizingLeft = useRef(false);
+  const isResizingRight = useRef(false);
+  const isResizingVideo = useRef(false);
+  const isResizingSubtitle = useRef(false);
+
+  // AI Configuration State
+  const [settingsTab, setSettingsTab] = useState<'online' | 'local'>('local');
+  
   // Local LLM State
   const [localLLMConfig, setLocalLLMConfig] = useState<LocalLLMConfig>(() => {
       try {
@@ -54,6 +76,17 @@ export default function App() {
         return { enabled: false, endpoint: 'http://localhost:11434', model: '' };
       }
   });
+  
+  // Online Gemini State
+  const [geminiConfig, setGeminiConfig] = useState<GeminiConfig>(() => {
+      try {
+        const saved = localStorage.getItem('lingo_gemini_config');
+        return saved ? JSON.parse(saved) : { apiKey: '' };
+      } catch {
+        return { apiKey: '' };
+      }
+  });
+
   const [localModels, setLocalModels] = useState<string[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [checkingModel, setCheckingModel] = useState(false);
@@ -66,10 +99,97 @@ export default function App() {
   // Race condition protection
   const processingIdRef = useRef(0);
 
-  // --- Local Settings Persistence ---
+  // --- Settings Persistence ---
   useEffect(() => {
     localStorage.setItem('lingo_local_llm', JSON.stringify(localLLMConfig));
   }, [localLLMConfig]);
+
+  useEffect(() => {
+    localStorage.setItem('lingo_gemini_config', JSON.stringify(geminiConfig));
+  }, [geminiConfig]);
+
+  // --- Resizing Logic ---
+  const startResizingLeft = useCallback(() => {
+    isResizingLeft.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  const startResizingRight = useCallback(() => {
+    isResizingRight.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  const startResizingVideo = useCallback(() => {
+    isResizingVideo.current = true;
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  const startResizingSubtitle = useCallback(() => {
+    isResizingSubtitle.current = true;
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  const stopResizing = useCallback(() => {
+    isResizingLeft.current = false;
+    isResizingRight.current = false;
+    isResizingVideo.current = false;
+    isResizingSubtitle.current = false;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  }, []);
+
+  const handleMouseMove = useCallback((e: MouseEvent) => {
+    const windowWidth = window.innerWidth;
+    const windowHeight = window.innerHeight;
+    
+    // Estimate fixed vertical space (Header ~64px + Controls ~180px + Resizers ~8px)
+    // We leave a generous buffer to ensure flex items don't overflow
+    const CHROME_HEIGHT = 250; 
+    const availableHeight = windowHeight - CHROME_HEIGHT;
+
+    // Constraints
+    const MIN_SIDEBAR_WIDTH = 250;
+    const MIN_VIDEO_HEIGHT = 200;
+    const MIN_SUBTITLE_HEIGHT = 100;
+    const MIN_DEFINITION_HEIGHT = 150;
+
+    if (isResizingLeft.current) {
+      const newWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(e.clientX, windowWidth * 0.4));
+      setLeftPanelWidth(newWidth);
+    }
+    if (isResizingRight.current) {
+      const newWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(windowWidth - e.clientX, windowWidth * 0.4));
+      setRightPanelWidth(newWidth);
+    }
+    if (isResizingVideo.current) {
+      // Calculate max possible height for video while preserving min space for subtitle & definition
+      const maxVideoHeight = Math.max(MIN_VIDEO_HEIGHT, availableHeight - subtitleHeight - MIN_DEFINITION_HEIGHT);
+      // Clamp
+      const newHeight = Math.min(Math.max(MIN_VIDEO_HEIGHT, videoHeight + e.movementY), maxVideoHeight);
+      setVideoHeight(newHeight);
+    }
+    if (isResizingSubtitle.current) {
+      // Calculate max possible height for subtitle while preserving min space for definition (Video is fixed state)
+      const maxSubtitleHeight = Math.max(MIN_SUBTITLE_HEIGHT, availableHeight - videoHeight - MIN_DEFINITION_HEIGHT);
+      // Clamp
+      const newHeight = Math.min(Math.max(MIN_SUBTITLE_HEIGHT, subtitleHeight + e.movementY), maxSubtitleHeight);
+      setSubtitleHeight(newHeight);
+    }
+  }, [videoHeight, subtitleHeight]);
+
+  useEffect(() => {
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', stopResizing);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', stopResizing);
+    };
+  }, [handleMouseMove, stopResizing]);
+
 
   // --- Model Preload Logic ---
   useEffect(() => {
@@ -117,6 +237,14 @@ export default function App() {
     }
   };
 
+  // --- Click Interceptor for Load Video ---
+  const handleLoadVideoClick = (e: React.MouseEvent) => {
+    // If in Offline Mode AND model is NOT ready
+    if (isOffline && modelStatus !== 'ready') {
+      e.preventDefault(); // Stop file picker from opening
+      setShowModelAlert(true); // Show custom modal
+    }
+  };
 
   // --- File Handling ---
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -127,6 +255,7 @@ export default function App() {
     setCurrentTime(0);
     setDuration(0);
     setIsPlaying(false);
+    setErrorMsg(null); // Clear previous errors
     
     // Set video source for the player
     const url = URL.createObjectURL(file);
@@ -150,6 +279,7 @@ export default function App() {
         setSelectedWord(null);
         setIsProcessing(true);
         setErrorMsg(null);
+        setIsPlaying(false); // Stop playback when regeneration starts
 
         // If offline and model not ready, this will likely trigger download events too
         if (isOffline && modelStatus === 'idle') {
@@ -157,20 +287,22 @@ export default function App() {
         }
 
         try {
+          // Pass the API key if online
           await generateSubtitles(videoFile, (newSegments) => {
                // Only update if this request is still the active one
                if (processingIdRef.current === currentId) {
                    setSubtitles(newSegments);
                }
-          }, isOffline, selectedModelId);
+          }, isOffline, selectedModelId, geminiConfig.apiKey);
           
           if (!isOffline && processingIdRef.current === currentId) {
              setIsProcessing(false);
           }
-        } catch (error) {
+        } catch (error: any) {
           console.error("Subtitle generation failed", error);
           if (processingIdRef.current === currentId) {
-              setErrorMsg(`Could not generate subtitles (${isOffline ? 'Offline' : 'Online'}).`);
+              // Show the specific error from service (e.g. "Browser cannot decode...")
+              setErrorMsg(error.message || `Could not generate subtitles (${isOffline ? 'Offline' : 'Online'}).`);
               setIsProcessing(false);
           }
         }
@@ -183,7 +315,7 @@ export default function App() {
 
     return () => clearTimeout(timer);
 
-  }, [videoFile, isOffline, selectedModelId]);
+  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey]);
 
 
   // --- Video Logic ---
@@ -283,8 +415,8 @@ export default function App() {
 
     setLoadingWord(true);
     try {
-      // Pass local config to service
-      const def = await getWordDefinition(cleanWord, context, isOffline, localLLMConfig);
+      // Pass local config and API key to service
+      const def = await getWordDefinition(cleanWord, context, isOffline, localLLMConfig, geminiConfig.apiKey);
       setSelectedWord(def);
       if (videoRef.current && isPlaying) {
         videoRef.current.pause();
@@ -337,6 +469,27 @@ export default function App() {
   return (
     <div className="flex h-screen bg-black text-gray-100 font-sans overflow-hidden">
       
+      {/* MODEL REQUIREMENT ALERT MODAL */}
+      {showModelAlert && (
+        <div className="fixed inset-0 z-[110] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
+            <div className="bg-gray-900 border border-yellow-700/50 rounded-xl shadow-2xl w-full max-w-sm p-6 text-center relative animate-in zoom-in-95 duration-200">
+                <div className="mx-auto w-12 h-12 bg-yellow-900/30 rounded-full flex items-center justify-center mb-4">
+                    <AlertTriangle className="text-yellow-500" size={24} />
+                </div>
+                <h3 className="text-xl font-bold text-white mb-2">Offline Model Required</h3>
+                <p className="text-gray-400 mb-6 text-sm leading-relaxed">
+                   Please download the Whisper model from the sidebar before loading a video in offline mode.
+                </p>
+                <button 
+                    onClick={() => setShowModelAlert(false)}
+                    className="w-full py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white font-medium rounded-lg transition-colors"
+                >
+                    I Understand
+                </button>
+            </div>
+        </div>
+      )}
+
       {/* SETTINGS MODAL */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
@@ -350,74 +503,126 @@ export default function App() {
 
                 <h3 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
                     <Settings className="text-blue-500" />
-                    Local AI Settings
+                    Settings
                 </h3>
-                
-                {/* Enable Toggle */}
-                <div className="flex items-center justify-between mb-6 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
-                    <div className="flex flex-col">
-                        <span className="font-medium text-gray-200">Enable Local LLM</span>
-                        <span className="text-xs text-gray-500">Use local Ollama for definitions</span>
-                    </div>
+
+                {/* TABS */}
+                <div className="flex border-b border-gray-700 mb-6">
                     <button 
-                        onClick={() => setLocalLLMConfig(p => ({...p, enabled: !p.enabled}))}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${localLLMConfig.enabled ? 'bg-blue-600' : 'bg-gray-600'}`}
+                        onClick={() => setSettingsTab('local')}
+                        className={`flex-1 pb-3 text-sm font-medium transition-colors border-b-2 ${settingsTab === 'local' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-200'}`}
                     >
-                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${localLLMConfig.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                        <div className="flex items-center justify-center gap-2">
+                            <Server size={16} />
+                            Local AI (Ollama)
+                        </div>
+                    </button>
+                    <button 
+                        onClick={() => setSettingsTab('online')}
+                        className={`flex-1 pb-3 text-sm font-medium transition-colors border-b-2 ${settingsTab === 'online' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-200'}`}
+                    >
+                        <div className="flex items-center justify-center gap-2">
+                            <Cloud size={16} />
+                            Online (Gemini)
+                        </div>
                     </button>
                 </div>
-
-                {/* Configuration Fields */}
-                <div className={`space-y-5 transition-opacity duration-200 ${localLLMConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                    <div>
-                        <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Endpoint URL</label>
-                        <div className="flex gap-2">
-                            <input 
-                                type="text" 
-                                value={localLLMConfig.endpoint}
-                                onChange={(e) => setLocalLLMConfig(p => ({...p, endpoint: e.target.value}))}
-                                className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
-                                placeholder="http://localhost:11434"
-                            />
+                
+                {/* TAB CONTENT: LOCAL */}
+                {settingsTab === 'local' && (
+                    <div className="space-y-6">
+                        {/* Enable Toggle */}
+                        <div className="flex items-center justify-between p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                            <div className="flex flex-col">
+                                <span className="font-medium text-gray-200">Enable Local LLM</span>
+                                <span className="text-xs text-gray-500">Use local Ollama for definitions in offline mode</span>
+                            </div>
                             <button 
-                                onClick={checkLocalConnection}
-                                disabled={checkingModel}
-                                className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg hover:bg-gray-700 text-gray-300 transition-colors disabled:opacity-50"
-                                title="Check Connection & Fetch Models"
+                                onClick={() => setLocalLLMConfig(p => ({...p, enabled: !p.enabled}))}
+                                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${localLLMConfig.enabled ? 'bg-blue-600' : 'bg-gray-600'}`}
                             >
-                                {checkingModel ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
+                                <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${localLLMConfig.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
                             </button>
                         </div>
-                    </div>
 
-                    <div>
-                        <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
-                        {localModels.length > 0 ? (
-                            <div className="relative">
-                                <select 
-                                    value={localLLMConfig.model}
-                                    onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
-                                    className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none appearance-none cursor-pointer"
-                                >
-                                    <option value="">Select a model...</option>
-                                    {localModels.map(m => <option key={m} value={m}>{m}</option>)}
-                                </select>
-                                <ChevronDown size={14} className="absolute right-3 top-3 text-gray-500 pointer-events-none" />
+                        {/* Configuration Fields */}
+                        <div className={`space-y-5 transition-opacity duration-200 ${localLLMConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                            <div>
+                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Endpoint URL</label>
+                                <div className="flex gap-2">
+                                    <input 
+                                        type="text" 
+                                        value={localLLMConfig.endpoint}
+                                        onChange={(e) => setLocalLLMConfig(p => ({...p, endpoint: e.target.value}))}
+                                        className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                        placeholder="http://localhost:11434"
+                                    />
+                                    <button 
+                                        onClick={checkLocalConnection}
+                                        disabled={checkingModel}
+                                        className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg hover:bg-gray-700 text-gray-300 transition-colors disabled:opacity-50"
+                                        title="Check Connection & Fetch Models"
+                                    >
+                                        {checkingModel ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
+                                    </button>
+                                </div>
                             </div>
-                        ) : (
-                             <input 
-                                type="text" 
-                                value={localLLMConfig.model}
-                                onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
-                                className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none placeholder-gray-700"
-                                placeholder="e.g. llama3, mistral"
-                            />
-                        )}
-                        <p className="text-[10px] text-gray-500 mt-2">
-                            Click the refresh icon to list installed models from your local endpoint.
-                        </p>
+
+                            <div>
+                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
+                                {localModels.length > 0 ? (
+                                    <div className="relative">
+                                        <select 
+                                            value={localLLMConfig.model}
+                                            onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
+                                            className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none appearance-none cursor-pointer"
+                                        >
+                                            <option value="">Select a model...</option>
+                                            {localModels.map(m => <option key={m} value={m}>{m}</option>)}
+                                        </select>
+                                        <ChevronDown size={14} className="absolute right-3 top-3 text-gray-500 pointer-events-none" />
+                                    </div>
+                                ) : (
+                                    <input 
+                                        type="text" 
+                                        value={localLLMConfig.model}
+                                        onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
+                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none placeholder-gray-700"
+                                        placeholder="e.g. llama3, mistral"
+                                    />
+                                )}
+                                <p className="text-[10px] text-gray-500 mt-2">
+                                    Click the refresh icon to list installed models from your local endpoint.
+                                </p>
+                            </div>
+                        </div>
                     </div>
-                </div>
+                )}
+
+                {/* TAB CONTENT: ONLINE */}
+                {settingsTab === 'online' && (
+                    <div className="space-y-6">
+                        <div className="bg-blue-900/10 border border-blue-900/30 rounded-lg p-4 mb-4">
+                            <p className="text-xs text-blue-300">
+                                Enter your Google Gemini API Key to use cloud-based transcription and definitions.
+                                This key is stored locally in your browser.
+                            </p>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Gemini API Key</label>
+                            <input 
+                                type="password" 
+                                value={geminiConfig.apiKey}
+                                onChange={(e) => setGeminiConfig(p => ({...p, apiKey: e.target.value}))}
+                                className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                placeholder="AIzaSy..."
+                            />
+                            <p className="text-[10px] text-gray-500 mt-2">
+                                Leave blank to attempt using the built-in demo key (if configured in environment).
+                            </p>
+                        </div>
+                    </div>
+                )}
 
                 <div className="mt-8 flex justify-end">
                     <button 
@@ -432,7 +637,10 @@ export default function App() {
       )}
 
       {/* LEFT SIDEBAR: TRANSCRIPT */}
-      <div className="w-80 bg-gray-950 border-r border-gray-800 flex flex-col flex-shrink-0 hidden md:flex">
+      <div 
+        style={{ width: leftPanelWidth }} 
+        className="bg-gray-950 border-r border-gray-800 flex flex-col flex-shrink-0 hidden md:flex transition-none relative"
+      >
         <div className="p-4 border-b border-gray-800 bg-gray-900/50">
             <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
@@ -564,6 +772,13 @@ export default function App() {
         </div>
       </div>
 
+      {/* LEFT RESIZER */}
+      <div 
+        onMouseDown={startResizingLeft}
+        className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
+        title="Drag to resize transcript"
+      />
+
       {/* CENTER: VIDEO PLAYER AREA */}
       <div className="flex-1 flex flex-col min-w-0 bg-gray-900 relative">
         
@@ -573,10 +788,13 @@ export default function App() {
             <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">LingoPlayer AI</h1>
           </div>
           <div className="flex items-center gap-4">
-            <label className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm font-medium rounded-lg cursor-pointer transition-colors border border-gray-700">
+            <label 
+                onClick={handleLoadVideoClick}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm font-medium rounded-lg cursor-pointer transition-colors border border-gray-700"
+            >
                 <Upload size={16} />
                 <span>Load Video</span>
-                <input type="file" accept="video/*" onChange={handleFileChange} className="hidden" />
+                <input type="file" accept=".mp4" onChange={handleFileChange} className="hidden" />
             </label>
             <button 
                 onClick={() => setShowVocabSidebar(!showVocabSidebar)}
@@ -591,7 +809,10 @@ export default function App() {
         <div className="flex-1 flex flex-col overflow-hidden">
           
           {/* 1. VIDEO CONTAINER */}
-          <div className="flex-grow bg-black flex items-center justify-center relative min-h-[300px]">
+          <div 
+             style={{ height: videoHeight }}
+             className="bg-black flex items-center justify-center relative flex-shrink-0"
+          >
             {videoSrc ? (
               <video
                 ref={videoRef}
@@ -601,6 +822,10 @@ export default function App() {
                 onTimeUpdate={handleTimeUpdate}
                 onLoadedMetadata={handleLoadedMetadata}
                 onEnded={() => setIsPlaying(false)}
+                onError={(e) => {
+                    // Only show generic error if we don't have a more specific one from service already
+                    if (!errorMsg) setErrorMsg("Browser cannot decode this video's audio. The format might be unsupported.");
+                }}
                 playsInline
               />
             ) : (
@@ -614,8 +839,19 @@ export default function App() {
             )}
           </div>
 
+          {/* VERTICAL RESIZER 1 (Video <-> Subtitles) */}
+          <div 
+            onMouseDown={startResizingVideo}
+            className="h-1 cursor-row-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 flex items-center justify-center group"
+          >
+              <GripHorizontal size={12} className="text-gray-600 opacity-0 group-hover:opacity-100" />
+          </div>
+
           {/* 2. DEDICATED SUBTITLE AREA */}
-          <div className="bg-gray-900 border-b border-t border-gray-800 p-6 text-center min-h-[120px] flex items-center justify-center">
+          <div 
+             style={{ height: subtitleHeight }}
+             className="bg-gray-900 p-6 text-center flex flex-col items-center justify-center flex-shrink-0 overflow-y-auto"
+          >
              {/* Show spinner ONLY if we have NO subtitles yet. If we have partials, show them! */}
              {isProcessing && subtitles.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-2 animate-pulse">
@@ -642,40 +878,64 @@ export default function App() {
             )}
           </div>
 
+          {/* VERTICAL RESIZER 2 (Subtitles <-> Definition) */}
+           <div 
+            onMouseDown={startResizingSubtitle}
+            className="h-1 cursor-row-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 flex items-center justify-center group"
+          >
+              <GripHorizontal size={12} className="text-gray-600 opacity-0 group-hover:opacity-100" />
+          </div>
+
           {/* 3. WORD DEFINITION PANEL */}
-          <WordDefinitionPanel 
-              definition={selectedWord} 
-              onAddToVocab={addToVocab}
-              isSaved={selectedWord ? vocabulary.some(v => v.word === selectedWord.word) : false}
-              isLoading={loadingWord}
-          />
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+             <WordDefinitionPanel 
+                definition={selectedWord} 
+                onAddToVocab={addToVocab}
+                isSaved={selectedWord ? vocabulary.some(v => v.word === selectedWord.word) : false}
+                isLoading={loadingWord}
+             />
+          </div>
           
-          {/* 4. CONTROLS */}
-          <VideoControls 
-              isPlaying={isPlaying}
-              onPlayPause={togglePlayPause}
-              playbackMode={playbackMode}
-              onToggleMode={() => setPlaybackMode(m => m === PlaybackMode.CONTINUOUS ? PlaybackMode.LOOP_SENTENCE : PlaybackMode.CONTINUOUS)}
-              playbackRate={playbackRate}
-              onRateChange={handleRateChange}
-              onPrevSentence={handlePrevSentence}
-              onNextSentence={handleNextSentence}
-              hasSubtitles={subtitles.length > 0}
-              currentTime={currentTime}
-              duration={duration}
-              onSeek={handleSeek}
-              volume={volume}
-              onVolumeChange={handleVolumeChange}
-              isMuted={isMuted}
-              onToggleMute={toggleMute}
-          />
+          {/* 4. CONTROLS (Fixed at bottom) */}
+          <div className="flex-shrink-0">
+            <VideoControls 
+                isPlaying={isPlaying}
+                onPlayPause={togglePlayPause}
+                playbackMode={playbackMode}
+                onToggleMode={() => setPlaybackMode(m => m === PlaybackMode.CONTINUOUS ? PlaybackMode.LOOP_SENTENCE : PlaybackMode.CONTINUOUS)}
+                playbackRate={playbackRate}
+                onRateChange={handleRateChange}
+                onPrevSentence={handlePrevSentence}
+                onNextSentence={handleNextSentence}
+                hasSubtitles={subtitles.length > 0}
+                currentTime={currentTime}
+                duration={duration}
+                onSeek={handleSeek}
+                volume={volume}
+                onVolumeChange={handleVolumeChange}
+                isMuted={isMuted}
+                onToggleMute={toggleMute}
+            />
+          </div>
 
         </div>
       </div>
 
+      {/* RIGHT RESIZER */}
+      {showVocabSidebar && (
+        <div 
+            onMouseDown={startResizingRight}
+            className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
+            title="Drag to resize vocabulary"
+        />
+      )}
+
       {/* RIGHT SIDEBAR: VOCABULARY */}
       {showVocabSidebar && (
-        <div className="w-80 bg-gray-950 border-l border-gray-800 flex flex-col flex-shrink-0 animate-in slide-in-from-right duration-300 absolute md:static inset-y-0 right-0 z-50 md:z-auto shadow-2xl md:shadow-none">
+        <div 
+            style={{ width: rightPanelWidth }}
+            className="bg-gray-950 border-l border-gray-800 flex flex-col flex-shrink-0 animate-in slide-in-from-right duration-300 absolute md:static inset-y-0 right-0 z-50 md:z-auto shadow-2xl md:shadow-none transition-none"
+        >
            <div className="p-4 border-b border-gray-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <BookOpen className="text-green-500" />
@@ -686,7 +946,7 @@ export default function App() {
                  <button 
                     onClick={() => setIsSettingsOpen(true)}
                     className="p-1.5 text-gray-500 hover:text-white rounded-md transition-colors"
-                    title="Settings (Local LLM)"
+                    title="Settings"
                  >
                     <Settings size={18} />
                  </button>

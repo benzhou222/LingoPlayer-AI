@@ -30,7 +30,7 @@ export const WordDefinitionPanel: React.FC<WordDefinitionPanelProps> = ({
 
   if (isLoading) {
     return (
-      <div className="h-48 flex items-center justify-center bg-gray-900 border-t border-gray-800 text-gray-500">
+      <div className="h-full min-h-[150px] flex items-center justify-center bg-gray-900 border-t border-gray-800 text-gray-500">
         <div className="flex flex-col items-center gap-2">
             <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
             <span className="text-sm">Consulting Offline Dictionary...</span>
@@ -41,14 +41,14 @@ export const WordDefinitionPanel: React.FC<WordDefinitionPanelProps> = ({
 
   if (!definition) {
     return (
-      <div className="h-48 flex items-center justify-center bg-gray-900 border-t border-gray-800 text-gray-500">
+      <div className="h-full min-h-[150px] flex items-center justify-center bg-gray-900 border-t border-gray-800 text-gray-500">
         <span className="italic">Click any word in the subtitle to see its definition.</span>
       </div>
     );
   }
 
   return (
-    <div className="h-48 bg-gray-900 border-t border-gray-800 p-6 flex flex-col md:flex-row gap-6 overflow-y-auto">
+    <div className="h-full min-h-[150px] bg-gray-900 border-t border-gray-800 p-6 flex flex-col md:flex-row gap-6 overflow-y-auto">
       {/* Header Info */}
       <div className="flex-shrink-0 min-w-[200px]">
         <div className="flex items-baseline gap-3 mb-2">

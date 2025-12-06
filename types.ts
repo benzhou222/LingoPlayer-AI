@@ -30,6 +30,10 @@ export interface LocalLLMConfig {
   model: string;
 }
 
+export interface GeminiConfig {
+  apiKey: string;
+}
+
 // Worker Types
 export interface WorkerMessage {
   type: 'load' | 'generate' | 'ready' | 'update' | 'complete' | 'error';
