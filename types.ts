@@ -23,3 +23,20 @@ export enum PlaybackMode {
   CONTINUOUS = 'CONTINUOUS',
   LOOP_SENTENCE = 'LOOP_SENTENCE'
 }
+
+export interface LocalLLMConfig {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+}
+
+// Worker Types
+export interface WorkerMessage {
+  type: 'load' | 'generate' | 'ready' | 'update' | 'complete' | 'error';
+  data?: any;
+}
+
+export interface WorkerPayload {
+  audio: Float32Array;
+  sampleRate: number;
+}

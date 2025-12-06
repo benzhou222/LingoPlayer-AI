@@ -1,5 +1,5 @@
 {
-  "name": "LingoPlayer AI",
-  "description": "An intelligent video player for language learners. Features auto-generated subtitles, sentence-looping, AI-powered word definitions, and a personal vocabulary builder.",
+  "name": "LingoPlayer Offline",
+  "description": "A fully offline intelligent video player. Features on-device AI for subtitles (Whisper), local dictionary definitions, and native text-to-speech.",
   "requestFramePermissions": []
 }

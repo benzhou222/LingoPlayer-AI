@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { WordDefinition, VocabularyItem } from '../types';
+import { WordDefinition } from '../types';
 import { Volume2, Plus, Check } from 'lucide-react';
-import { generateSpeech, playAudio } from '../services/geminiService';
+import { playAudio } from '../services/geminiService';
 
 interface WordDefinitionPanelProps {
   definition: WordDefinition | null;
@@ -19,16 +19,13 @@ export const WordDefinitionPanel: React.FC<WordDefinitionPanelProps> = ({
   const [isSpeaking, setIsSpeaking] = useState(false);
 
   const handleSpeak = async () => {
-    if (!definition || isSpeaking) return;
+    if (!definition) return;
     setIsSpeaking(true);
-    try {
-      const audioData = await generateSpeech(definition.word);
-      await playAudio(audioData);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setIsSpeaking(false);
-    }
+    // In offline mode, we pass the word directly to the modified 'playAudio' which uses speechSyntehsis
+    await playAudio(definition.word);
+    
+    // Reset icon after a short delay since we don't have an "onend" event easily piped through
+    setTimeout(() => setIsSpeaking(false), 1000);
   };
 
   if (isLoading) {
@@ -36,7 +33,7 @@ export const WordDefinitionPanel: React.FC<WordDefinitionPanelProps> = ({
       <div className="h-48 flex items-center justify-center bg-gray-900 border-t border-gray-800 text-gray-500">
         <div className="flex flex-col items-center gap-2">
             <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-            <span className="text-sm">Consulting AI Dictionary...</span>
+            <span className="text-sm">Consulting Offline Dictionary...</span>
         </div>
       </div>
     );

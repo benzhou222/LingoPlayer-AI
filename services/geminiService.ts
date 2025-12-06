@@ -1,348 +1,398 @@
-import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { SubtitleSegment, WordDefinition } from "../types";
+import { SubtitleSegment, WordDefinition, LocalLLMConfig } from "../types";
+import { lookupWord, speakText } from "../utils/dictionary";
+import { GoogleGenAI, Type } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- OFFLINE WORKER CODE ---
+const WORKER_CODE = `
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 
-// Constants for audio processing
-const TARGET_SAMPLE_RATE = 16000;
-const CHUNK_DURATION_S = 60; // Process 60 seconds at a time to prevent drift
-const CHUNK_SIZE = CHUNK_DURATION_S * TARGET_SAMPLE_RATE;
+env.allowLocalModels = false;
+env.useBrowserCache = true;
 
-// Helper: Resample AudioBuffer to 16kHz Mono PCM Int16Array
-// Async with yielding to prevent UI blocking
-const resampleToPCM = async (buffer: AudioBuffer): Promise<Int16Array> => {
-  const numChannels = 1; // Mono
-  const sourceRate = buffer.sampleRate;
-  const ratio = sourceRate / TARGET_SAMPLE_RATE;
-  const outputLength = Math.floor(buffer.length / ratio);
-  
-  const pcmData = new Int16Array(outputLength);
-  const channelData = buffer.getChannelData(0); // Use left channel
-  
-  const CHUNK_TIME_MS = 15; // Yield every 15ms
-  let startTime = performance.now();
-  
-  for (let i = 0; i < outputLength; i++) {
-    // Linear Interpolation
-    const originalIndex = i * ratio;
-    const indexFloor = Math.floor(originalIndex);
-    const indexCeil = Math.min(indexFloor + 1, channelData.length - 1);
-    const weight = originalIndex - indexFloor;
-    
-    const sample = channelData[indexFloor] * (1 - weight) + channelData[indexCeil] * weight;
+class PipelineFactory {
+    static task = 'automatic-speech-recognition';
+    static instances = {};
 
-    // Float to Int16
-    const s = Math.max(-1, Math.min(1, sample));
-    pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    static async getInstance(modelId, progress_callback = null) {
+        if (!this.instances[modelId]) {
+            console.log("Loading Whisper model: " + modelId);
+            this.instances[modelId] = await pipeline(this.task, modelId, {
+                progress_callback
+            });
+            console.log("Whisper model loaded: " + modelId);
+        }
+        return this.instances[modelId];
+    }
+}
 
-    // Yield to main thread
-    if (i % 2000 === 0) {
-        if (performance.now() - startTime > CHUNK_TIME_MS) {
-            await new Promise(resolve => setTimeout(resolve, 0));
-            startTime = performance.now();
+self.onmessage = async (event) => {
+    const message = event.data;
+
+    if (message.type === 'load') {
+        const { model } = message.data;
+        try {
+            await PipelineFactory.getInstance(model, (data) => {
+                self.postMessage({ type: 'progress', data });
+            });
+            self.postMessage({ type: 'ready' });
+        } catch (error) {
+            self.postMessage({ type: 'error', data: error.message });
+        }
+        return;
+    }
+
+    if (message.type === 'generate') {
+        const { audio, model } = message.data;
+        // Whisper expects 16kHz audio
+        const SAMPLE_RATE = 16000;
+        // Process in 30-second chunks (standard Whisper window)
+        const CHUNK_LENGTH_S = 30;
+        const CHUNK_SIZE = CHUNK_LENGTH_S * SAMPLE_RATE;
+        
+        try {
+            const transcriber = await PipelineFactory.getInstance(model, (data) => {
+                 self.postMessage({ type: 'progress', data });
+            });
+            
+            const totalSamples = audio.length;
+            let offsetSamples = 0;
+            
+            // Loop through audio in chunks
+            while (offsetSamples < totalSamples) {
+                const endSamples = Math.min(offsetSamples + CHUNK_SIZE, totalSamples);
+                const chunk = audio.slice(offsetSamples, endSamples);
+                
+                // Run inference on this chunk
+                // We don't use the pipeline's built-in chunking/stride for the whole file 
+                // because we want immediate partial feedback.
+                const output = await transcriber(chunk, {
+                    language: 'english',
+                    return_timestamps: true,
+                });
+
+                // Adjust timestamps relative to the whole file
+                const timeOffset = offsetSamples / SAMPLE_RATE;
+                
+                const adjustedChunks = (output.chunks || []).map(c => {
+                    const start = (c.timestamp[0] === null ? 0 : c.timestamp[0]) + timeOffset;
+                    const end = (c.timestamp[1] === null ? start + 2 : c.timestamp[1]) + timeOffset;
+                    return {
+                        text: c.text,
+                        timestamp: [start, end]
+                    };
+                });
+
+                // Emit partial results immediately
+                self.postMessage({ type: 'partial', data: adjustedChunks });
+
+                offsetSamples += CHUNK_SIZE;
+            }
+
+            self.postMessage({ type: 'complete' });
+
+        } catch (error) {
+            self.postMessage({ type: 'error', data: error.message });
         }
     }
-  }
+};
+`;
 
-  return pcmData;
+// --- OFFLINE WORKER MANAGER ---
+let worker: Worker | null = null;
+let onSubtitleProgressCallback: ((segments: SubtitleSegment[]) => void) | null = null;
+let onLoadProgressCallback: ((data: any) => void) | null = null;
+let accumulatedSegments: SubtitleSegment[] = [];
+
+const initWorker = () => {
+  if (!worker) {
+    const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    worker = new Worker(workerUrl, { type: 'module' });
+    
+    worker.onmessage = (event) => {
+      const { type, data } = event.data;
+      
+      if (type === 'progress') {
+          if (onLoadProgressCallback) onLoadProgressCallback(data);
+      } 
+      else if (type === 'ready') {
+        if (onLoadProgressCallback) onLoadProgressCallback({ status: 'ready' });
+      } 
+      else if (type === 'partial') {
+        // Append new chunks to our local accumulator
+        const newSegments: SubtitleSegment[] = (data || []).map((chunk: any, index: number) => ({
+           id: accumulatedSegments.length + index,
+           start: chunk.timestamp[0],
+           end: chunk.timestamp[1],
+           text: chunk.text.trim()
+        }));
+        
+        // Filter out empty or extremely short hallucinations
+        const validSegments = newSegments.filter(s => s.text.length > 1);
+        
+        if (validSegments.length > 0) {
+            accumulatedSegments = [...accumulatedSegments, ...validSegments];
+            if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
+        }
+      }
+      else if (type === 'complete') {
+        // Final sanity check or cleanup if needed
+        if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
+      } 
+      else if (type === 'error') {
+        console.error("Worker Error:", data);
+        if (onLoadProgressCallback) onLoadProgressCallback({ status: 'error', error: data });
+        if (!data.file && typeof data === 'string') alert("Offline AI Error: " + data); 
+      }
+    };
+  }
+  return worker;
 };
 
-// Helper: Wrap PCM data in WAV container and return Base64
-const pcmToWavBase64 = (pcmData: Int16Array): Promise<string> => {
+// --- AUDIO UTILITIES ---
+const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float32Array | string> => {
+    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    const arrayBuffer = await videoFile.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+    if (forOffline) {
+        // Offline needs raw Float32 data
+        return audioBuffer.getChannelData(0);
+    } else {
+        // Online needs Base64 WAV
+        const pcmData = audioBuffer.getChannelData(0);
+        const wavBuffer = encodeWAV(pcmData, 16000);
+        return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
+    }
+};
+
+function encodeWAV(samples: Float32Array, sampleRate: number) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeString = (view: DataView, offset: number, string: string) => {
+        for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+    };
+
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buffer;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
-        try {
-            const numChannels = 1;
-            const bitDepth = 16;
-            // pcmData is likely a subarray, so we use byteLength which reflects the size of the view
-            const dataLength = pcmData.byteLength; 
-            const bufferLength = 44 + dataLength;
-            const arrayBuffer = new ArrayBuffer(bufferLength);
-            const view = new DataView(arrayBuffer);
+        const reader = new FileReader();
+        reader.onloadend = () => {
+             const base64String = (reader.result as string).split(',')[1];
+             resolve(base64String);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+}
 
-            const writeString = (offset: number, string: string) => {
-                for (let i = 0; i < string.length; i++) {
-                    view.setUint8(offset + i, string.charCodeAt(i));
+// --- ONLINE MODE IMPLEMENTATION ---
+let aiInstance: GoogleGenAI | null = null;
+
+const getAI = () => {
+    if (!aiInstance) {
+        // Lazily access process.env to prevent ReferenceError in browser/offline modes
+        // @ts-ignore
+        const key = typeof process !== 'undefined' ? process.env.API_KEY : '';
+        if (!key) console.warn("API Key not found. Online mode will fail.");
+        aiInstance = new GoogleGenAI({ apiKey: key });
+    }
+    return aiInstance;
+};
+
+const generateSubtitlesOnline = async (file: File): Promise<SubtitleSegment[]> => {
+    const base64Audio = await getAudioData(file, false) as string;
+    
+    const response = await getAI().models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: {
+            parts: [
+                { inlineData: { mimeType: 'audio/wav', data: base64Audio } },
+                { text: `Transcribe this audio into subtitles. 
+                         Strictly output a JSON array of objects. 
+                         Each object must have: "start" (number, seconds), "end" (number, seconds), and "text" (string).
+                         Group words into complete, meaningful sentences. Do not fragment sentences.` 
                 }
-            };
-
-            // RIFF
-            writeString(0, 'RIFF');
-            view.setUint32(4, 36 + dataLength, true);
-            writeString(8, 'WAVE');
-            // fmt
-            writeString(12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, 1, true);
-            view.setUint16(22, numChannels, true);
-            view.setUint32(24, TARGET_SAMPLE_RATE, true);
-            view.setUint32(28, TARGET_SAMPLE_RATE * numChannels * (bitDepth / 8), true);
-            view.setUint16(32, numChannels * (bitDepth / 8), true);
-            view.setUint16(34, bitDepth, true);
-            // data
-            writeString(36, 'data');
-            view.setUint32(40, dataLength, true);
-
-            // Write PCM
-            // CRITICAL FIX: Use byteOffset and byteLength to handle Subarrays correctly.
-            // Without this, it tries to copy the entire underlying buffer of the parent array.
-            const pcmBytes = new Uint8Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength);
-            const finalBytes = new Uint8Array(arrayBuffer);
-            finalBytes.set(pcmBytes, 44);
-
-            const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const result = reader.result as string;
-                if (result) {
-                    resolve(result.split(',')[1]);
-                } else {
-                    reject(new Error("Failed to convert audio to base64"));
+            ]
+        },
+        config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: {
+                        start: { type: Type.NUMBER },
+                        end: { type: Type.NUMBER },
+                        text: { type: Type.STRING }
+                    }
                 }
-            };
-            reader.onerror = (e) => reject(e);
-            reader.readAsDataURL(blob);
-        } catch (e) {
-            reject(e);
+            }
         }
     });
+
+    if (response.text) {
+        const raw = JSON.parse(response.text);
+        return raw.map((item: any, i: number) => ({ ...item, id: i }));
+    }
+    return [];
 };
 
-// Robust JSON parsing
-const robustParseJSON = (jsonStr: string): any[] => {
-  let cleanStr = jsonStr.replace(/```json/g, '').replace(/```/g, '').trim();
-  try {
-    return JSON.parse(cleanStr);
-  } catch (e) {
-    // console.warn("Standard JSON parse failed, attempting recovery...");
-  }
-
-  try {
-    const lastObjectEnd = cleanStr.lastIndexOf('}');
-    if (lastObjectEnd === -1) return [];
-    let recoveredStr = cleanStr.substring(0, lastObjectEnd + 1);
-    if (!recoveredStr.trim().startsWith('[')) recoveredStr = '[' + recoveredStr;
-    if (!recoveredStr.trim().endsWith(']')) recoveredStr = recoveredStr + ']';
-    return JSON.parse(recoveredStr);
-  } catch (e) {
-     // console.warn("Array recovery failed, attempting individual object extraction...");
-     const objects: any[] = [];
-     let balance = 0;
-     let start = -1;
-     for (let i = 0; i < cleanStr.length; i++) {
-        const char = cleanStr[i];
-        if (char === '{') {
-           if (balance === 0) start = i;
-           balance++;
-        } else if (char === '}') {
-           balance--;
-           if (balance === 0 && start !== -1) {
-              const substring = cleanStr.substring(start, i + 1);
-              try {
-                 const obj = JSON.parse(substring);
-                 if (obj.start !== undefined && obj.text !== undefined) objects.push(obj);
-              } catch(err) {}
-              start = -1;
-           }
+const getWordDefinitionOnline = async (word: string, context: string): Promise<WordDefinition> => {
+    const response = await getAI().models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `Define the word "${word}" based on this context: "${context}".
+                   Return JSON with: word, phonetic (IPA), partOfSpeech, meaning, usage (short usage in context), example (a new example sentence).`,
+        config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                    word: { type: Type.STRING },
+                    phonetic: { type: Type.STRING },
+                    partOfSpeech: { type: Type.STRING },
+                    meaning: { type: Type.STRING },
+                    usage: { type: Type.STRING },
+                    example: { type: Type.STRING }
+                }
+            }
         }
-     }
-     return objects;
-  }
+    });
+    
+    if (response.text) {
+        return JSON.parse(response.text) as WordDefinition;
+    }
+    throw new Error("Failed to parse definition");
 };
+
+// --- LOCAL LLM IMPLEMENTATION ---
+export const fetchLocalModels = async (endpoint: string): Promise<string[]> => {
+    try {
+        const baseUrl = endpoint.replace(/\/$/, '');
+        const response = await fetch(`${baseUrl}/api/tags`);
+        if (!response.ok) throw new Error('Failed to connect to Local LLM');
+        const data = await response.json();
+        return data.models.map((m: any) => m.name);
+    } catch (e) {
+        console.error("Local LLM Fetch Error:", e);
+        throw e;
+    }
+};
+
+const getLocalLLMDefinition = async (word: string, context: string, config: LocalLLMConfig): Promise<WordDefinition> => {
+    const baseUrl = config.endpoint.replace(/\/$/, '');
+    
+    // Prompt engineered for generic LLMs like Llama 3
+    const prompt = `Define the word "${word}" based on this context: "${context}".
+    Return a JSON object with exactly these keys:
+    - word (string)
+    - phonetic (string, IPA format)
+    - partOfSpeech (string)
+    - meaning (string)
+    - usage (string, short usage based on context)
+    - example (string, a new example sentence)
+    
+    Output valid JSON only. Do not include markdown or explanations.`;
+
+    try {
+        const response = await fetch(`${baseUrl}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: config.model,
+                prompt: prompt,
+                stream: false,
+                format: "json" 
+            })
+        });
+
+        const data = await response.json();
+        const text = data.response;
+        return JSON.parse(text) as WordDefinition;
+    } catch (e) {
+        console.error("Local LLM Generation Error:", e);
+        throw new Error("Failed to get definition from Local LLM");
+    }
+};
+
+
+// --- MAIN EXPORTS (DISPATCHER) ---
 
 export const generateSubtitles = async (
     videoFile: File, 
-    onProgress?: (segments: SubtitleSegment[]) => void
+    onProgress: (segments: SubtitleSegment[]) => void,
+    isOffline: boolean = true,
+    modelId: string = 'Xenova/whisper-tiny'
 ): Promise<SubtitleSegment[]> => {
-  try {
-    // 1. Decode Audio
-    await new Promise(resolve => setTimeout(resolve, 50)); // Yield
-    const arrayBuffer = await videoFile.arrayBuffer();
     
-    const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
-    const audioContext = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
-    
-    let audioBuffer: AudioBuffer;
-    try {
-        audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    } finally {
-        if (audioContext.state !== 'closed') await audioContext.close();
-    }
-
-    // 2. Resample to 16kHz PCM
-    const pcmData = await resampleToPCM(audioBuffer);
-
-    // 3. Split into Chunks
-    const chunks: { data: Int16Array, startTime: number }[] = [];
-    for (let i = 0; i < pcmData.length; i += CHUNK_SIZE) {
-        chunks.push({
-            data: pcmData.subarray(i, Math.min(i + CHUNK_SIZE, pcmData.length)),
-            startTime: i / TARGET_SAMPLE_RATE
-        });
-    }
-
-    // 4. Process Chunks (Sequential or Batched to preserve order and avoid rate limits)
-    let allSegments: SubtitleSegment[] = [];
-    let globalSegmentId = 0;
-
-    for (const chunk of chunks) {
-        // Skip tiny chunks at the end
-        if (chunk.data.length < 16000) continue; 
-
-        const base64 = await pcmToWavBase64(chunk.data);
+    if (isOffline) {
+        // Reset accumulation for new run
+        accumulatedSegments = [];
+        onSubtitleProgressCallback = onProgress;
         
-        // REFINED PROMPT: Strictly enforced sentence-level segmentation
-        const prompt = `
-          You are an expert subtitle transcriber.
-          Task: Transcribe the audio chunk and split it into **complete sentences** or **meaningful phrases**.
+        const w = initWorker();
+        const audioData = await getAudioData(videoFile, true) as Float32Array;
+        w.postMessage({ type: 'generate', data: { audio: audioData, model: modelId } });
+        return []; // Progress handled via callback
+    } else {
+        const segments = await generateSubtitlesOnline(videoFile);
+        onProgress(segments);
+        return segments;
+    }
+};
 
-          STRICT RULES:
-          1. **DO NOT** output single words as segments. You MUST group words into natural phrases (e.g., 5-20 words).
-          2. **DO NOT** reset timestamps to 0 for every word.
-          3. Only break segments at natural pauses, punctuation, or ends of sentences.
-          4. If the audio is cut off at the start/end, transcribe the partial phrase available.
-          5. Return raw JSON array ONLY. No Markdown.
-
-          Example of Correct Output:
-          [
-            { "start": 0.5, "end": 4.2, "text": "This is a complete sentence with multiple words." },
-            { "start": 4.5, "end": 8.1, "text": "And this is the next sentence, properly grouped." }
-          ]
-        `;
-
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: {
-            parts: [
-              { inlineData: { mimeType: "audio/wav", data: base64 } },
-              { text: prompt }
-            ],
-          },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  start: { type: Type.NUMBER },
-                  end: { type: Type.NUMBER },
-                  text: { type: Type.STRING },
-                },
-                required: ["start", "end", "text"],
-              },
-            },
-          },
-        });
-
-        const rawSegments = robustParseJSON(response.text || "[]");
-        
-        // Adjust timestamps and add to list
-        const adjustedSegments = rawSegments
-            .filter((seg: any) => seg.text && seg.text.trim().length > 0) // Filter empty
-            .map((seg: any) => ({
-                id: globalSegmentId++,
-                start: seg.start + chunk.startTime,
-                end: seg.end + chunk.startTime,
-                text: seg.text
-            }));
-
-        // Emit progress if callback provided
-        if (onProgress && adjustedSegments.length > 0) {
-            onProgress(adjustedSegments);
+export const getWordDefinition = async (
+    word: string, 
+    contextSentence: string,
+    isOffline: boolean = true,
+    localLLMConfig?: LocalLLMConfig
+): Promise<WordDefinition> => {
+    if (isOffline) {
+        if (localLLMConfig?.enabled && localLLMConfig.endpoint && localLLMConfig.model) {
+            try {
+                return await getLocalLLMDefinition(word, contextSentence, localLLMConfig);
+            } catch (e) {
+                console.warn("Local LLM failed, falling back to static dictionary", e);
+                return lookupWord(word, contextSentence);
+            }
         }
-
-        allSegments = [...allSegments, ...adjustedSegments];
-        
-        // Small delay between requests to be nice to API
-        await new Promise(r => setTimeout(r, 200));
+        return lookupWord(word, contextSentence);
+    } else {
+        return getWordDefinitionOnline(word, contextSentence);
     }
-
-    return allSegments;
-
-  } catch (error) {
-    console.error("Error generating subtitles:", error);
-    throw error;
-  }
 };
 
-export const getWordDefinition = async (word: string, contextSentence: string): Promise<WordDefinition> => {
-  try {
-    const prompt = `
-      Define the word "${word}" based on its context in the sentence: "${contextSentence}".
-      Return a JSON object with:
-      - word: the base form of the word
-      - phonetic: IPA phonetic transcription
-      - partOfSpeech: e.g., noun, verb, adjective
-      - meaning: a concise definition in English
-      - usage: A brief explanation of how it is used in this context
-      - example: A new example sentence using the word
-    `;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            word: { type: Type.STRING },
-            phonetic: { type: Type.STRING },
-            partOfSpeech: { type: Type.STRING },
-            meaning: { type: Type.STRING },
-            usage: { type: Type.STRING },
-            example: { type: Type.STRING },
-          },
-          required: ["word", "phonetic", "meaning", "usage", "example"],
-        },
-      },
-    });
-
-    const jsonStr = response.text;
-    if (!jsonStr) throw new Error("No definition generated");
-    return JSON.parse(jsonStr);
-  } catch (error) {
-    console.error("Error getting definition:", error);
-    throw error;
-  }
+export const playAudio = async (textOrBase64: string) => {
+    speakText(textOrBase64);
 };
 
-export const generateSpeech = async (text: string): Promise<string> => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: text }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Kore' },
-          },
-        },
-      },
-    });
-
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64Audio) throw new Error("No audio generated");
-    return base64Audio;
-
-  } catch (error) {
-    console.error("Error generating speech:", error);
-    throw error;
-  }
+// --- MODEL MANAGEMENT EXPORTS ---
+export const preloadOfflineModel = (modelId: string = 'Xenova/whisper-tiny') => {
+    const w = initWorker();
+    w.postMessage({ type: 'load', data: { model: modelId } });
 };
 
-export const playAudio = async (base64String: string) => {
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-    const binaryString = atob(base64String);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    source.start(0);
+export const setLoadProgressCallback = (callback: (data: any) => void) => {
+    onLoadProgressCallback = callback;
 };
