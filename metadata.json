@@ -1,0 +1,5 @@
+{
+  "name": "LingoPlayer AI",
+  "description": "An intelligent video player for language learners. Features auto-generated subtitles, sentence-looping, AI-powered word definitions, and a personal vocabulary builder.",
+  "requestFramePermissions": []
+}
