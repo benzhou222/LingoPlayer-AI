@@ -238,14 +238,10 @@ function blobToBase64(blob: Blob): Promise<string> {
 let aiInstance: GoogleGenAI | null = null;
 
 const getAI = (apiKey?: string) => {
-    // If a specific key is provided (from UI settings), use it immediately
     if (apiKey) {
         return new GoogleGenAI({ apiKey });
     }
-
-    // Fallback/Legacy logic
     if (!aiInstance) {
-        // Lazily access process.env to prevent ReferenceError in browser/offline modes
         // @ts-ignore
         const key = typeof process !== 'undefined' ? process.env.API_KEY : '';
         if (!key) console.warn("API Key not found. Online mode will fail.");
@@ -336,7 +332,6 @@ export const fetchLocalModels = async (endpoint: string): Promise<string[]> => {
 const getLocalLLMDefinition = async (word: string, context: string, config: LocalLLMConfig): Promise<WordDefinition> => {
     const baseUrl = config.endpoint.replace(/\/$/, '');
     
-    // Prompt engineered for generic LLMs like Llama 3
     const prompt = `Define the word "${word}" based on this context: "${context}".
     Return a JSON object with exactly these keys:
     - word (string)
@@ -371,24 +366,61 @@ const getLocalLLMDefinition = async (word: string, context: string, config: Loca
 
 
 // --- LOCAL ASR (WHISPER) IMPLEMENTATION ---
+export const testLocalWhisperConnection = async (endpoint: string): Promise<boolean> => {
+    try {
+        await fetch(endpoint, { 
+            method: 'OPTIONS', 
+            credentials: 'omit'
+        });
+        return true; 
+    } catch (e: any) {
+        console.error("Local Whisper Connection Test Failed:", e);
+        try {
+             // Diagnostic: Try no-cors to see if server is UP but blocked
+             await fetch(endpoint, { method: 'GET', mode: 'no-cors' });
+             console.warn("Server is reachable but blocking CORS.");
+             return true; 
+        } catch(e2) {
+             return false;
+        }
+    }
+}
+
 const generateSubtitlesLocalServer = async (audioData: Float32Array, config: LocalASRConfig): Promise<SubtitleSegment[]> => {
     console.log("Using Local Whisper Server at:", config.endpoint);
+
+    // 1. Check for Mixed Content issues immediately
+    const isHttps = window.location.protocol === 'https:';
+    const isLocalHttp = config.endpoint.includes('localhost') || config.endpoint.includes('127.0.0.1');
     
-    // 1. Convert float32 to WAV blob
+    if (isHttps && isLocalHttp && config.endpoint.startsWith('http:')) {
+         throw new Error(
+            `Mixed Content Block: You are running this app on HTTPS, but trying to connect to HTTP Localhost.\n` +
+            `Browsers strictly block this for security.\n` +
+            `SOLUTION: Download this app's source code and run it locally via http://localhost.`
+        );
+    }
+    
     const wavBuffer = encodeWAV(audioData, 16000);
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     const file = new File([blob], "audio.wav", { type: "audio/wav" });
 
-    // 2. Prepare FormData
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('model', 'whisper-1'); // Placeholder model name, often ignored or configurable
+    formData.append('model', config.model || 'whisper-large'); 
+    formData.append('response_format', 'verbose_json');
+    formData.append('temperature', '0');
 
-    // 3. Fetch
     try {
+        // MATCHING VERIFIED CURL BEHAVIOR:
+        // No Authorization Header
+        // No explicit Content-Type (browser handles multipart/form-data boundary)
         const response = await fetch(config.endpoint, {
             method: 'POST',
-            body: formData
+            body: formData,
+            mode: 'cors', // Explicitly state CORS
+            credentials: 'omit', // Prevent sending cookies (Simple Request attempt)
+            cache: 'no-store'
         });
 
         if (!response.ok) {
@@ -398,7 +430,6 @@ const generateSubtitlesLocalServer = async (audioData: Float32Array, config: Loc
 
         const data = await response.json();
         
-        // Handle OpenAI format: { text: "...", segments: [...] }
         if (data.segments && Array.isArray(data.segments)) {
              return data.segments.map((s: any, i: number) => ({
                  id: i,
@@ -408,25 +439,44 @@ const generateSubtitlesLocalServer = async (audioData: Float32Array, config: Loc
              }));
         } 
         
-        // Handle simple text response (fallback)
         if (data.text) {
-             console.warn("Local server returned text only, no segments. Creating single segment.");
+             console.warn("Local server returned text only, no segments.");
              return [{ id: 0, start: 0, end: 9999, text: data.text.trim() }];
         }
 
         return [];
     } catch (e: any) {
         console.error("Local Whisper Server Failed:", e);
-        // Check for specific network errors
+        if (e.message.startsWith("Mixed Content")) throw e;
+
+        // DIAGNOSTIC CHECK FOR CORS
         if (e.name === 'TypeError' && e.message === 'Failed to fetch') {
-            throw new Error(
-                `Connection Failed to ${config.endpoint}.\n` +
-                `Possible causes:\n` +
-                `1. Server is not running or port is wrong.\n` +
-                `2. CORS is not enabled on your local server.\n` +
-                `3. Mixed Content Block: If this app is running on HTTPS, browsers block HTTP connections to localhost.\n` +
-                `   Solution: Run this app locally via localhost.`
-            );
+            try {
+                // Try a 'no-cors' request. 
+                // If this succeeds (doesn't throw), it means the server IS listening,
+                // but the browser blocked the previous response due to CORS headers.
+                await fetch(config.endpoint, { method: 'GET', mode: 'no-cors' });
+                
+                throw new Error(
+                    `Server is ONLINE but blocking the browser (CORS Error).\n\n` +
+                    `The request reached your server, but it did not return 'Access-Control-Allow-Origin'.\n` +
+                    `Since you confirmed 'curl' works, this is definitely a browser CORS restriction.\n` +
+                    `Please ensure your LocalAI container is started with:\n` +
+                    `--cors=true --cors-allow-origins="*"\n\n` +
+                    `Also check Chrome PNA: chrome://flags/#block-insecure-private-network-requests`
+                );
+            } catch (diagnosticErr: any) {
+                if (diagnosticErr.message.startsWith("Server is ONLINE")) throw diagnosticErr;
+
+                // If no-cors also fails, the server is truly unreachable
+                throw new Error(
+                    `Connection Failed to ${config.endpoint}.\n\n` +
+                    `Possible causes:\n` +
+                    `1. Server is down or on a different port.\n` +
+                    `2. Chrome blocked access to private network (PNA).\n` +
+                    `3. You are running on HTTPS accessing HTTP.`
+                );
+            }
         }
         throw e;
     }
@@ -447,7 +497,6 @@ export const generateSubtitles = async (
     if (isOffline) {
         // CHECK LOCAL ASR FIRST
         if (localASRConfig?.enabled && localASRConfig.endpoint) {
-             // Reset state logic usually handled by caller, but we can emit empty start
              onProgress([]); 
              
              const audioData = await getAudioData(videoFile, true) as Float32Array;
@@ -458,22 +507,19 @@ export const generateSubtitles = async (
         }
 
         // BROWSER WASM FALLBACK
-        // Reset accumulation for new run
         accumulatedSegments = [];
         onSubtitleProgressCallback = onProgress;
         
-        // Start new job ID
         activeJobId++;
         const currentJobId = activeJobId;
         
         const w = initWorker();
         const audioData = await getAudioData(videoFile, true) as Float32Array;
         
-        // Check if job is still active after audio extraction (which can take time)
         if (currentJobId !== activeJobId) return [];
 
         w.postMessage({ type: 'generate', data: { audio: audioData, model: modelId, jobId: currentJobId } });
-        return []; // Progress handled via callback
+        return []; 
     } else {
         const segments = await generateSubtitlesOnline(videoFile, apiKey);
         onProgress(segments);

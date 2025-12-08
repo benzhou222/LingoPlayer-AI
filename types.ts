@@ -33,6 +33,7 @@ export interface LocalLLMConfig {
 export interface LocalASRConfig {
   enabled: boolean;
   endpoint: string;
+  model: string;
 }
 
 export interface GeminiConfig {

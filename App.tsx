@@ -81,9 +81,9 @@ export default function App() {
   const [localASRConfig, setLocalASRConfig] = useState<LocalASRConfig>(() => {
       try {
         const saved = localStorage.getItem('lingo_local_asr');
-        return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://localhost:8080/v1/audio/transcriptions' };
+        return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions', model: 'whisper-large' };
       } catch {
-        return { enabled: false, endpoint: 'http://localhost:8080/v1/audio/transcriptions' };
+        return { enabled: false, endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions', model: 'whisper-large' };
       }
   });
   
@@ -578,17 +578,33 @@ export default function App() {
 
                              {/* Configuration for Local Server */}
                             <div className={`transition-opacity duration-200 ${localASRConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">API Endpoint</label>
-                                <input 
-                                    type="text" 
-                                    value={localASRConfig.endpoint}
-                                    onChange={(e) => setLocalASRConfig(p => ({...p, endpoint: e.target.value}))}
-                                    className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
-                                    placeholder="http://localhost:8080/v1/audio/transcriptions"
-                                />
-                                <p className="text-[10px] text-gray-500 mt-2">
-                                    Supports OpenAI-compatible endpoints (LocalAI, Whisper.cpp server).
-                                </p>
+                                <div className="mb-3">
+                                    <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">API Endpoint</label>
+                                    <input 
+                                        type="text" 
+                                        value={localASRConfig.endpoint}
+                                        onChange={(e) => setLocalASRConfig(p => ({...p, endpoint: e.target.value}))}
+                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                        placeholder="http://127.0.0.1:8080/v1/audio/transcriptions"
+                                    />
+                                    <p className="text-[10px] text-gray-500 mt-2">
+                                        Supports OpenAI-compatible endpoints (e.g. /v1/audio/transcriptions or /inference).
+                                    </p>
+                                </div>
+                                
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
+                                    <input 
+                                        type="text" 
+                                        value={localASRConfig.model}
+                                        onChange={(e) => setLocalASRConfig(p => ({...p, model: e.target.value}))}
+                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                        placeholder="whisper-large"
+                                    />
+                                    <p className="text-[10px] text-gray-500 mt-2">
+                                        Server-side model identifier (e.g. whisper-large).
+                                    </p>
+                                </div>
                             </div>
 
                             {/* BROWSER MODEL MANAGER (Visible if Local Server is DISABLED) */}
