@@ -28,13 +28,6 @@ async function importFFmpeg() {
 
     console.log("Loading FFmpeg modules...");
 
-    // 1. Load errors.js (Dependency of utils)
-    // 2. Load utils.js (Dependency of worker & classes)
-    // 3. Load const.js (Dependency of worker & classes)
-    // 4. Load worker.js (Dependency of classes)
-    // 5. Load classes.js (Dependency of index)
-    // 6. Load index.js (Entry point)
-
     try {
         // --- 1. errors.js ---
         const errorsCode = await fetchText(`${baseURL}/errors.js`);
@@ -42,7 +35,6 @@ async function importFFmpeg() {
 
         // --- 2. utils.js ---
         let utilsCode = await fetchText(`${baseURL}/utils.js`);
-        // Patch utils to import errors from blob
         utilsCode = utilsCode.replace(
             /from\s+['"]\.\/errors\.js['"]/g, 
             `from '${errorsBlobUrl}'`
@@ -55,7 +47,6 @@ async function importFFmpeg() {
 
         // --- 4. worker.js ---
         let workerCode = await fetchText(`${baseURL}/worker.js`);
-        // Patch worker to import dependencies from blobs
         workerCode = workerCode.replace(
             /from\s+['"]\.\/utils\.js['"]/g, 
             `from '${utilsBlobUrl}'`
@@ -67,7 +58,6 @@ async function importFFmpeg() {
 
         // --- 5. classes.js ---
         let classesCode = await fetchText(`${baseURL}/classes.js`);
-        // Patch classes to import dependencies from blobs & external util
         classesCode = classesCode.replace(
             /from\s+['"]\.\/const\.js['"]/g, 
             `from '${constBlobUrl}'`
@@ -82,15 +72,6 @@ async function importFFmpeg() {
             `from '${errorsBlobUrl}'`
         );
         
-        // IMPORTANT: Patch the Worker creation to use the full CDN URL for the actual worker script
-        // The library tries to load "worker.js" relative to itself.
-        // We need to force it to use a Blob URL or the full CDN path if CORS allows.
-        // For 0.12.x, we usually pass coreURL and wasmURL to load(), but the worker wrapper itself 
-        // is created inside classes.js.
-        // The best way for the worker wrapper is to let it be, but ensuring it doesn't cross-origin fail.
-        
-        // Actually, best practice for 0.12.x in strict env is to rely on the class structure 
-        // but ensuring the imports inside classes.js resolve. 
         const classesBlobUrl = createBlobURL(classesCode);
 
         // --- 6. index.js ---
@@ -105,12 +86,12 @@ async function importFFmpeg() {
         const indexBlobUrl = createBlobURL(indexCode);
 
         // --- Dynamic Import ---
-        const module = await import(indexBlobUrl);
+        // @vite-ignore
+        const module = await import(/* @vite-ignore */ indexBlobUrl);
         const { FFmpeg } = module;
         
         ffmpeg = new FFmpeg();
         
-        // Logging
         ffmpeg.on('log', ({ message }: { message: string }) => {
             console.log('[FFmpeg Log]:', message);
         });
@@ -171,13 +152,6 @@ export async function extractAudioAsWav(videoFile: File): Promise<Float32Array> 
         const outputName = 'output.wav';
         
         await instance.writeFile(inputName, await fetchFile(videoFile));
-        
-        // Convert to 16kHz mono pcm_f32le (which is what AudioContext buffers usually are, or closest to it)
-        // actually we output a WAV and then decode it with AudioContext again to get Float32Array easily
-        // Or we can output raw float32. Let's output WAV for compatibility.
-        // -ar 16000: 16kHz
-        // -ac 1: Mono
-        // -map 0:a:0 : Select first audio track
         
         // Check threads
         const threads = window.crossOriginIsolated ? Math.min(navigator.hardwareConcurrency || 4, 8) : 1;

@@ -63,15 +63,11 @@ self.onmessage = async (event) => {
                 const endSamples = Math.min(offsetSamples + CHUNK_SIZE, totalSamples);
                 const chunk = audio.slice(offsetSamples, endSamples);
                 
-                // Run inference on this chunk
-                // We don't use the pipeline's built-in chunking/stride for the whole file 
-                // because we want immediate partial feedback.
                 const output = await transcriber(chunk, {
                     language: 'english',
                     return_timestamps: true,
                 });
 
-                // Adjust timestamps relative to the whole file
                 const timeOffset = offsetSamples / SAMPLE_RATE;
                 
                 const adjustedChunks = (output.chunks || []).map(c => {
@@ -83,7 +79,6 @@ self.onmessage = async (event) => {
                     };
                 });
 
-                // Emit partial results immediately with jobId
                 self.postMessage({ type: 'partial', data: adjustedChunks, jobId });
 
                 offsetSamples += CHUNK_SIZE;
@@ -103,7 +98,7 @@ let worker: Worker | null = null;
 let onSubtitleProgressCallback: ((segments: SubtitleSegment[]) => void) | null = null;
 let onLoadProgressCallback: ((data: any) => void) | null = null;
 let accumulatedSegments: SubtitleSegment[] = [];
-let activeJobId = 0; // Track the current generation job
+let activeJobId = 0;
 
 const initWorker = () => {
   if (!worker) {
@@ -114,11 +109,7 @@ const initWorker = () => {
     worker.onmessage = (event) => {
       const { type, data, jobId } = event.data;
       
-      // If this message belongs to a specific job (generation), check if it's still active
-      if (typeof jobId === 'number' && jobId !== activeJobId) {
-          // Ignore stale messages from previous runs
-          return;
-      }
+      if (typeof jobId === 'number' && jobId !== activeJobId) return;
 
       if (type === 'progress') {
           if (onLoadProgressCallback) onLoadProgressCallback(data);
@@ -127,7 +118,6 @@ const initWorker = () => {
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'ready' });
       } 
       else if (type === 'partial') {
-        // Append new chunks to our local accumulator
         const newSegments: SubtitleSegment[] = (data || []).map((chunk: any, index: number) => ({
            id: accumulatedSegments.length + index,
            start: chunk.timestamp[0],
@@ -135,7 +125,6 @@ const initWorker = () => {
            text: chunk.text.trim()
         }));
         
-        // Filter out empty or extremely short hallucinations
         const validSegments = newSegments.filter(s => s.text.length > 1);
         
         if (validSegments.length > 0) {
@@ -144,13 +133,11 @@ const initWorker = () => {
         }
       }
       else if (type === 'complete') {
-        // Final sanity check or cleanup if needed
         if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
       } 
       else if (type === 'error') {
         console.error("Worker Error:", data);
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'error', error: data });
-        // Only show alert if it's a general error, not a cancelled job error
         if (!data.file && typeof data === 'string') alert("Offline AI Error: " + data); 
       }
     };
@@ -164,7 +151,6 @@ const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float
         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         const arrayBuffer = await videoFile.arrayBuffer();
         
-        // Try native decoding first
         try {
             const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
             if (forOffline) {
@@ -176,8 +162,6 @@ const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float
             }
         } catch (decodeError) {
             console.warn("Native decoding failed, trying FFmpeg fallback...", decodeError);
-            
-            // Fallback: Use FFmpeg to extract audio
             const pcmData = await extractAudioAsWav(videoFile);
             
             if (forOffline) {
@@ -375,111 +359,96 @@ export const testLocalWhisperConnection = async (endpoint: string): Promise<bool
         return true; 
     } catch (e: any) {
         console.error("Local Whisper Connection Test Failed:", e);
-        try {
-             // Diagnostic: Try no-cors to see if server is UP but blocked
-             await fetch(endpoint, { method: 'GET', mode: 'no-cors' });
-             console.warn("Server is reachable but blocking CORS.");
-             return true; 
-        } catch(e2) {
-             return false;
-        }
+        return false;
     }
 }
 
-const generateSubtitlesLocalServer = async (audioData: Float32Array, config: LocalASRConfig): Promise<SubtitleSegment[]> => {
-    console.log("Using Local Whisper Server at:", config.endpoint);
-
-    // 1. Check for Mixed Content issues immediately
-    const isHttps = window.location.protocol === 'https:';
-    const isLocalHttp = config.endpoint.includes('localhost') || config.endpoint.includes('127.0.0.1');
+/**
+ * Handles communication with Local Whisper Server.
+ * Slices audio into small chunks (60s) to avoid 413 Payload Too Large errors.
+ */
+const generateSubtitlesLocalServer = async (audioData: Float32Array, config: LocalASRConfig, onPartial: (segs: SubtitleSegment[]) => void): Promise<SubtitleSegment[]> => {
+    const SAMPLE_RATE = 16000;
+    // Chunk size: 60 seconds.
+    const CHUNK_DURATION = 60; 
+    const CHUNK_SIZE = CHUNK_DURATION * SAMPLE_RATE;
+    const totalSamples = audioData.length;
     
-    if (isHttps && isLocalHttp && config.endpoint.startsWith('http:')) {
-         throw new Error(
-            `Mixed Content Block: You are running this app on HTTPS, but trying to connect to HTTP Localhost.\n` +
-            `Browsers strictly block this for security.\n` +
-            `SOLUTION: Download this app's source code and run it locally via http://localhost.`
-        );
-    }
+    let accumulatedSegments: SubtitleSegment[] = [];
+    let offsetSamples = 0;
     
-    const wavBuffer = encodeWAV(audioData, 16000);
-    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-    const file = new File([blob], "audio.wav", { type: "audio/wav" });
+    console.log(`Starting Local Whisper Transcription (Direct Connection). Total: ${(totalSamples/SAMPLE_RATE).toFixed(2)}s.`);
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('model', config.model || 'whisper-large'); 
-    formData.append('response_format', 'verbose_json');
-    formData.append('temperature', '0');
+    while (offsetSamples < totalSamples) {
+        const endSamples = Math.min(offsetSamples + CHUNK_SIZE, totalSamples);
+        const chunk = audioData.slice(offsetSamples, endSamples);
+        const timeOffset = offsetSamples / SAMPLE_RATE;
 
-    try {
-        // MATCHING VERIFIED CURL BEHAVIOR:
-        // No Authorization Header
-        // No explicit Content-Type (browser handles multipart/form-data boundary)
-        const response = await fetch(config.endpoint, {
-            method: 'POST',
-            body: formData,
-            mode: 'cors', // Explicitly state CORS
-            credentials: 'omit', // Prevent sending cookies (Simple Request attempt)
-            cache: 'no-store'
-        });
+        // Encode chunk to WAV
+        const wavBuffer = encodeWAV(chunk, SAMPLE_RATE);
+        const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+        const file = new File([blob], "chunk.wav", { type: "audio/wav" });
 
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Local Server Error (${response.status}): ${errText}`);
-        }
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('model', config.model || 'whisper-large'); 
+        formData.append('response_format', 'verbose_json');
+        formData.append('temperature', '0');
 
-        const data = await response.json();
-        
-        if (data.segments && Array.isArray(data.segments)) {
-             return data.segments.map((s: any, i: number) => ({
-                 id: i,
-                 start: s.start,
-                 end: s.end,
-                 text: s.text.trim()
-             }));
-        } 
-        
-        if (data.text) {
-             console.warn("Local server returned text only, no segments.");
-             return [{ id: 0, start: 0, end: 9999, text: data.text.trim() }];
-        }
+        try {
+            console.log(`Sending chunk to ${config.endpoint}: ${timeOffset}s`);
+            const response = await fetch(config.endpoint, {
+                method: 'POST',
+                body: formData,
+                credentials: 'omit' // Vital for reducing CORS triggers
+            });
 
-        return [];
-    } catch (e: any) {
-        console.error("Local Whisper Server Failed:", e);
-        if (e.message.startsWith("Mixed Content")) throw e;
-
-        // DIAGNOSTIC CHECK FOR CORS
-        if (e.name === 'TypeError' && e.message === 'Failed to fetch') {
-            try {
-                // Try a 'no-cors' request. 
-                // If this succeeds (doesn't throw), it means the server IS listening,
-                // but the browser blocked the previous response due to CORS headers.
-                await fetch(config.endpoint, { method: 'GET', mode: 'no-cors' });
-                
-                throw new Error(
-                    `Server is ONLINE but blocking the browser (CORS Error).\n\n` +
-                    `The request reached your server, but it did not return 'Access-Control-Allow-Origin'.\n` +
-                    `Since you confirmed 'curl' works, this is definitely a browser CORS restriction.\n` +
-                    `Please ensure your LocalAI container is started with:\n` +
-                    `--cors=true --cors-allow-origins="*"\n\n` +
-                    `Also check Chrome PNA: chrome://flags/#block-insecure-private-network-requests`
-                );
-            } catch (diagnosticErr: any) {
-                if (diagnosticErr.message.startsWith("Server is ONLINE")) throw diagnosticErr;
-
-                // If no-cors also fails, the server is truly unreachable
-                throw new Error(
-                    `Connection Failed to ${config.endpoint}.\n\n` +
-                    `Possible causes:\n` +
-                    `1. Server is down or on a different port.\n` +
-                    `2. Chrome blocked access to private network (PNA).\n` +
-                    `3. You are running on HTTPS accessing HTTP.`
-                );
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`Server Error (${response.status}): ${errText}`);
             }
+
+            const data = await response.json();
+            
+            let chunkSegments: SubtitleSegment[] = [];
+            
+            if (data.segments && Array.isArray(data.segments)) {
+                chunkSegments = data.segments.map((s: any, i: number) => ({
+                     id: accumulatedSegments.length + i,
+                     start: s.start + timeOffset,
+                     end: s.end + timeOffset,
+                     text: s.text.trim()
+                }));
+            } else if (data.text) {
+                chunkSegments = [{
+                    id: accumulatedSegments.length,
+                    start: timeOffset,
+                    end: (endSamples / SAMPLE_RATE),
+                    text: data.text.trim()
+                }];
+            }
+
+            if (chunkSegments.length > 0) {
+                accumulatedSegments = [...accumulatedSegments, ...chunkSegments];
+                onPartial(accumulatedSegments);
+            }
+
+        } catch (e: any) {
+            console.error("Local Whisper Chunk Failed:", e);
+            throw new Error(
+                `Connection Failed to ${config.endpoint}.\n\n` +
+                `Possible Causes:\n` +
+                `1. CORS: Your server MUST run with --cors=true --cors-allow-origins="*"\n` +
+                `2. Private Network Access: Chrome blocks localhost. Try disabling #block-insecure-private-network-requests flag.\n` +
+                `3. Mixed Content: If this app is running on HTTPS, it cannot access HTTP localhost.\n\n` + 
+                `Error: ${e.message}`
+            );
         }
-        throw e;
+
+        offsetSamples += CHUNK_SIZE;
     }
+
+    return accumulatedSegments;
 };
 
 
@@ -495,18 +464,15 @@ export const generateSubtitles = async (
 ): Promise<SubtitleSegment[]> => {
     
     if (isOffline) {
-        // CHECK LOCAL ASR FIRST
         if (localASRConfig?.enabled && localASRConfig.endpoint) {
              onProgress([]); 
              
              const audioData = await getAudioData(videoFile, true) as Float32Array;
-             const segments = await generateSubtitlesLocalServer(audioData, localASRConfig);
+             const segments = await generateSubtitlesLocalServer(audioData, localASRConfig, onProgress);
              
-             onProgress(segments);
              return segments;
         }
 
-        // BROWSER WASM FALLBACK
         accumulatedSegments = [];
         onSubtitleProgressCallback = onProgress;
         
@@ -553,7 +519,6 @@ export const playAudio = async (textOrBase64: string) => {
     speakText(textOrBase64);
 };
 
-// --- MODEL MANAGEMENT EXPORTS ---
 export const preloadOfflineModel = (modelId: string = 'Xenova/whisper-tiny') => {
     const w = initWorker();
     w.postMessage({ type: 'load', data: { model: modelId } });

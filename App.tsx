@@ -71,9 +71,10 @@ export default function App() {
   const [localLLMConfig, setLocalLLMConfig] = useState<LocalLLMConfig>(() => {
       try {
         const saved = localStorage.getItem('lingo_local_llm');
-        return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://localhost:11434', model: '' };
+        // Default to direct connection
+        return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://127.0.0.1:11434', model: '' };
       } catch {
-        return { enabled: false, endpoint: 'http://localhost:11434', model: '' };
+        return { enabled: false, endpoint: 'http://127.0.0.1:11434', model: '' };
       }
   });
 
@@ -81,6 +82,7 @@ export default function App() {
   const [localASRConfig, setLocalASRConfig] = useState<LocalASRConfig>(() => {
       try {
         const saved = localStorage.getItem('lingo_local_asr');
+        // Default to direct connection and whisper-large
         return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions', model: 'whisper-large' };
       } catch {
         return { enabled: false, endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions', model: 'whisper-large' };
@@ -160,12 +162,9 @@ export default function App() {
     const windowWidth = window.innerWidth;
     const windowHeight = window.innerHeight;
     
-    // Estimate fixed vertical space (Header ~64px + Controls ~180px + Resizers ~8px)
-    // We leave a generous buffer to ensure flex items don't overflow
     const CHROME_HEIGHT = 250; 
     const availableHeight = windowHeight - CHROME_HEIGHT;
 
-    // Constraints
     const MIN_SIDEBAR_WIDTH = 250;
     const MIN_VIDEO_HEIGHT = 200;
     const MIN_SUBTITLE_HEIGHT = 100;
@@ -180,16 +179,12 @@ export default function App() {
       setRightPanelWidth(newWidth);
     }
     if (isResizingVideo.current) {
-      // Calculate max possible height for video while preserving min space for subtitle & definition
       const maxVideoHeight = Math.max(MIN_VIDEO_HEIGHT, availableHeight - subtitleHeight - MIN_DEFINITION_HEIGHT);
-      // Clamp
       const newHeight = Math.min(Math.max(MIN_VIDEO_HEIGHT, videoHeight + e.movementY), maxVideoHeight);
       setVideoHeight(newHeight);
     }
     if (isResizingSubtitle.current) {
-      // Calculate max possible height for subtitle while preserving min space for definition (Video is fixed state)
       const maxSubtitleHeight = Math.max(MIN_SUBTITLE_HEIGHT, availableHeight - videoHeight - MIN_DEFINITION_HEIGHT);
-      // Clamp
       const newHeight = Math.min(Math.max(MIN_SUBTITLE_HEIGHT, subtitleHeight + e.movementY), maxSubtitleHeight);
       setSubtitleHeight(newHeight);
     }
@@ -207,7 +202,6 @@ export default function App() {
 
   // --- Model Preload Logic ---
   useEffect(() => {
-    // Register the callback to listen for model download events
     setLoadProgressCallback((data) => {
         if (data.status === 'progress') {
             setModelStatus('loading');
@@ -216,7 +210,6 @@ export default function App() {
             setModelStatus('ready');
             setDownloadProgress(null);
         } else if (data.status === 'done') {
-            // Individual file done
         }
     });
   }, []);
@@ -229,7 +222,6 @@ export default function App() {
   const handleModelChange = (newModelId: string) => {
       if (newModelId !== selectedModelId) {
           setSelectedModelId(newModelId);
-          // We reset status because we don't know if this new model is cached/ready
           setModelStatus('idle');
           setDownloadProgress(null);
       }
@@ -240,23 +232,20 @@ export default function App() {
     try {
         const models = await fetchLocalModels(localLLMConfig.endpoint);
         setLocalModels(models);
-        // Auto-select first if none selected
         if (!localLLMConfig.model && models.length > 0) {
             setLocalLLMConfig(p => ({ ...p, model: models[0] }));
         }
     } catch (e) {
-        alert("Could not connect to Local LLM. Make sure Ollama is running and accessible (check CORS settings).");
+        alert("Could not connect to Local LLM. Ensure Ollama is running (allow CORS if necessary).");
     } finally {
         setCheckingModel(false);
     }
   };
 
-  // --- Click Interceptor for Load Video ---
   const handleLoadVideoClick = (e: React.MouseEvent) => {
-    // If in Offline Mode AND model is NOT ready AND Local Whisper is NOT enabled
     if (isOffline && modelStatus !== 'ready' && !localASRConfig.enabled) {
-      e.preventDefault(); // Stop file picker from opening
-      setShowModelAlert(true); // Show custom modal
+      e.preventDefault();
+      setShowModelAlert(true);
     }
   };
 
@@ -265,21 +254,16 @@ export default function App() {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    // Reset player specific state immediately
     setCurrentTime(0);
     setDuration(0);
     setIsPlaying(false);
-    setErrorMsg(null); // Clear previous errors
+    setErrorMsg(null);
     
-    // Set video source for the player
     const url = URL.createObjectURL(file);
     setVideoSrc(url);
-    
-    // Update file state - this will trigger the useEffect to start processing
     setVideoFile(file);
   };
 
-  // Effect to handle Subtitle Generation (Runs on new file OR mode switch OR model switch)
   useEffect(() => {
     if (!videoFile) return;
 
@@ -287,59 +271,45 @@ export default function App() {
     processingIdRef.current = currentId;
 
     const processVideoForSubtitles = async () => {
-        // Reset UI for processing state
         setSubtitles([]);
         setCurrentSegmentIndex(-1);
         setSelectedWord(null);
         setIsProcessing(true);
         setErrorMsg(null);
-        setIsPlaying(false); // Stop playback when regeneration starts
+        setIsPlaying(false);
 
-        // If offline and model not ready and local whisper not enabled
         if (isOffline && !localASRConfig.enabled && modelStatus === 'idle') {
             setModelStatus('loading');
         }
 
         try {
-          // Pass the API key if online
           await generateSubtitles(videoFile, (newSegments) => {
-               // Only update if this request is still the active one
                if (processingIdRef.current === currentId) {
                    setSubtitles(newSegments);
                }
           }, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig);
           
           if (processingIdRef.current === currentId) {
-             // For Online/LocalASR, we might finish here. For Worker, it streams but complete msg logic is separate
-             // If we rely on worker's complete message for 'isProcessing=false', that's fine.
-             // But for LocalASR/Online, they are async awaited.
              if (!isOffline || localASRConfig.enabled) {
                  setIsProcessing(false);
              }
-             // For Browser Worker (isOffline && !localASR), we keep isProcessing=true?
-             // Actually, `generateSubtitles` for worker returns [] immediately and relies on callback.
-             // We need a way to know when worker is done to set isProcessing=false.
-             // Currently App.tsx doesn't have a callback for "Done".
-             // We can infer it if we want, or just leave "Analyzing..." spinner hidden if we have partials.
           }
         } catch (error: any) {
           console.error("Subtitle generation failed", error);
           if (processingIdRef.current === currentId) {
-              // Show the specific error from service (e.g. "Browser cannot decode...")
               setErrorMsg(error.message || `Could not generate subtitles (${isOffline ? 'Offline' : 'Online'}).`);
               setIsProcessing(false);
           }
         }
     };
 
-    // Small timeout to ensure UI updates state before heavy processing starts
     const timer = setTimeout(() => {
         processVideoForSubtitles();
     }, 100);
 
     return () => clearTimeout(timer);
 
-  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig]); // Added localASRConfig dependency
+  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig]); 
 
 
   // --- Video Logic ---
@@ -354,18 +324,14 @@ export default function App() {
     const time = videoRef.current.currentTime;
     setCurrentTime(time);
 
-    // FIX: Partial/Looping Logic
-    // If in loop mode, ensure we stay within the segment bounds strictly
     if (playbackMode === PlaybackMode.LOOP_SENTENCE && currentSegmentIndex !== -1) {
       const segment = subtitles[currentSegmentIndex];
       if (segment && time >= segment.end) {
         videoRef.current.currentTime = segment.start;
-        // Do not proceed to find next index to prevent skipping
         return;
       }
     }
 
-    // Find current subtitle (Standard logic)
     const index = subtitles.findIndex(sub => time >= sub.start && time < sub.end);
     if (index !== -1 && index !== currentSegmentIndex) {
       setCurrentSegmentIndex(index);
@@ -413,7 +379,6 @@ export default function App() {
     if (videoRef.current) videoRef.current.playbackRate = rate;
   };
 
-  // Volume Logic
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.volume = volume;
@@ -439,7 +404,6 @@ export default function App() {
 
     setLoadingWord(true);
     try {
-      // Pass local config and API key to service
       const def = await getWordDefinition(cleanWord, context, isOffline, localLLMConfig, geminiConfig.apiKey);
       setSelectedWord(def);
       if (videoRef.current && isPlaying) {
@@ -477,7 +441,6 @@ export default function App() {
     }
   };
 
-  // --- Render Helpers ---
   const renderInteractiveSubtitle = (text: string) => {
     return text.split(" ").map((word, i) => (
       <span 
@@ -493,7 +456,6 @@ export default function App() {
   return (
     <div className="flex h-screen bg-black text-gray-100 font-sans overflow-hidden">
       
-      {/* MODEL REQUIREMENT ALERT MODAL */}
       {showModelAlert && (
         <div className="fixed inset-0 z-[110] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
             <div className="bg-gray-900 border border-yellow-700/50 rounded-xl shadow-2xl w-full max-w-sm p-6 text-center relative animate-in zoom-in-95 duration-200">
@@ -514,7 +476,6 @@ export default function App() {
         </div>
       )}
 
-      {/* SETTINGS MODAL */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
             <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-md p-6 relative animate-in zoom-in-95 duration-200 overflow-y-auto max-h-[90vh]">
@@ -530,7 +491,6 @@ export default function App() {
                     Settings
                 </h3>
 
-                {/* TABS */}
                 <div className="flex border-b border-gray-700 mb-6">
                     <button 
                         onClick={() => setSettingsTab('local')}
@@ -552,21 +512,18 @@ export default function App() {
                     </button>
                 </div>
                 
-                {/* TAB CONTENT: LOCAL */}
                 {settingsTab === 'local' && (
                     <div className="space-y-8">
                         
-                        {/* 1. WHISPER ASR SECTION */}
                         <div className="space-y-4">
                             <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 border-b border-gray-800">
                                 <Mic size={14} /> Speech-to-Text (Whisper)
                             </h4>
                             
-                            {/* Enable Toggle for Local Server */}
                             <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-800">
                                 <div className="flex flex-col">
                                     <span className="font-medium text-gray-200 text-sm">Use Local Whisper Server</span>
-                                    <span className="text-[10px] text-gray-500">Connect to local server (e.g. Whisper.cpp)</span>
+                                    <span className="text-[10px] text-gray-500">Connect to local server directly</span>
                                 </div>
                                 <button 
                                     onClick={() => setLocalASRConfig(p => ({...p, enabled: !p.enabled}))}
@@ -576,7 +533,6 @@ export default function App() {
                                 </button>
                             </div>
 
-                             {/* Configuration for Local Server */}
                             <div className={`transition-opacity duration-200 ${localASRConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
                                 <div className="mb-3">
                                     <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">API Endpoint</label>
@@ -584,11 +540,11 @@ export default function App() {
                                         type="text" 
                                         value={localASRConfig.endpoint}
                                         onChange={(e) => setLocalASRConfig(p => ({...p, endpoint: e.target.value}))}
-                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700 font-mono"
                                         placeholder="http://127.0.0.1:8080/v1/audio/transcriptions"
                                     />
                                     <p className="text-[10px] text-gray-500 mt-2">
-                                        Supports OpenAI-compatible endpoints (e.g. /v1/audio/transcriptions or /inference).
+                                        Use <code>127.0.0.1</code> instead of localhost. Requires server CORS enabled.
                                     </p>
                                 </div>
                                 
@@ -601,13 +557,9 @@ export default function App() {
                                         className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
                                         placeholder="whisper-large"
                                     />
-                                    <p className="text-[10px] text-gray-500 mt-2">
-                                        Server-side model identifier (e.g. whisper-large).
-                                    </p>
                                 </div>
                             </div>
 
-                            {/* BROWSER MODEL MANAGER (Visible if Local Server is DISABLED) */}
                             {!localASRConfig.enabled && (
                                 <div className="mt-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
                                     <div className="flex items-center justify-between mb-3">
@@ -672,18 +624,15 @@ export default function App() {
                             )}
                         </div>
 
-
-                        {/* 2. OLLAMA LLM SECTION */}
                         <div className="space-y-4">
                             <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 border-b border-gray-800">
                                 <Server size={14} /> Text Generation (Ollama)
                             </h4>
 
-                            {/* Enable Toggle */}
                             <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-800">
                                 <div className="flex flex-col">
                                     <span className="font-medium text-gray-200 text-sm">Use Local Ollama</span>
-                                    <span className="text-[10px] text-gray-500">Use local LLM for word definitions</span>
+                                    <span className="text-[10px] text-gray-500">Connect to local server directly</span>
                                 </div>
                                 <button 
                                     onClick={() => setLocalLLMConfig(p => ({...p, enabled: !p.enabled}))}
@@ -693,7 +642,6 @@ export default function App() {
                                 </button>
                             </div>
 
-                            {/* Configuration Fields */}
                             <div className={`space-y-4 transition-opacity duration-200 ${localLLMConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
                                 <div>
                                     <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Endpoint URL</label>
@@ -702,8 +650,8 @@ export default function App() {
                                             type="text" 
                                             value={localLLMConfig.endpoint}
                                             onChange={(e) => setLocalLLMConfig(p => ({...p, endpoint: e.target.value}))}
-                                            className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
-                                            placeholder="http://localhost:11434"
+                                            className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700 font-mono"
+                                            placeholder="http://127.0.0.1:11434"
                                         />
                                         <button 
                                             onClick={checkLocalConnection}
@@ -745,7 +693,6 @@ export default function App() {
                     </div>
                 )}
 
-                {/* TAB CONTENT: ONLINE */}
                 {settingsTab === 'online' && (
                     <div className="space-y-6">
                         <div className="bg-blue-900/10 border border-blue-900/30 rounded-lg p-4 mb-4">
@@ -849,7 +796,6 @@ export default function App() {
                 </div>
                 ))}
                 
-                {/* Streaming Indicator in List */}
                 {isProcessing && subtitles.length > 0 && (
                    <div className="p-4 flex items-center justify-center gap-2 text-xs text-gray-500 animate-pulse">
                       <Loader2 size={12} className="animate-spin" />
@@ -861,7 +807,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* LEFT RESIZER */}
       <div 
         onMouseDown={startResizingLeft}
         className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
@@ -897,7 +842,6 @@ export default function App() {
         {/* MAIN CONTENT AREA */}
         <div className="flex-1 flex flex-col overflow-hidden">
           
-          {/* 1. VIDEO CONTAINER */}
           <div 
              style={{ height: videoHeight }}
              className="bg-black flex items-center justify-center relative flex-shrink-0"
@@ -912,7 +856,6 @@ export default function App() {
                 onLoadedMetadata={handleLoadedMetadata}
                 onEnded={() => setIsPlaying(false)}
                 onError={(e) => {
-                    // Only show generic error if we don't have a more specific one from service already
                     if (!errorMsg) setErrorMsg("Browser cannot decode this video's audio. The format might be unsupported.");
                 }}
                 playsInline
@@ -928,7 +871,6 @@ export default function App() {
             )}
           </div>
 
-          {/* VERTICAL RESIZER 1 (Video <-> Subtitles) */}
           <div 
             onMouseDown={startResizingVideo}
             className="h-1 cursor-row-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 flex items-center justify-center group"
@@ -936,12 +878,10 @@ export default function App() {
               <GripHorizontal size={12} className="text-gray-600 opacity-0 group-hover:opacity-100" />
           </div>
 
-          {/* 2. DEDICATED SUBTITLE AREA */}
           <div 
              style={{ height: subtitleHeight }}
              className="bg-gray-900 p-6 text-center flex flex-col items-center justify-center flex-shrink-0 overflow-y-auto"
           >
-             {/* Show spinner ONLY if we have NO subtitles yet. If we have partials, show them! */}
              {isProcessing && subtitles.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-2 animate-pulse">
                      <span className="text-blue-400 text-sm font-medium">
@@ -965,7 +905,6 @@ export default function App() {
                 </div>
              )}
              
-             {/* Active Subtitle Overlay (if any) */}
              {currentSegmentIndex !== -1 && subtitles[currentSegmentIndex] && (
                  <div className="mt-4 animate-in fade-in slide-in-from-bottom-2 duration-200">
                      <p className="text-xl md:text-2xl font-medium text-white leading-relaxed max-w-3xl">
@@ -975,7 +914,6 @@ export default function App() {
              )}
           </div>
 
-          {/* VERTICAL RESIZER 2 (Subtitle <-> Definition) */}
           <div 
             onMouseDown={startResizingSubtitle}
             className="h-1 cursor-row-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 flex items-center justify-center group"
@@ -983,7 +921,6 @@ export default function App() {
               <GripHorizontal size={12} className="text-gray-600 opacity-0 group-hover:opacity-100" />
           </div>
 
-          {/* 3. DEFINITION PANEL */}
           <div className="flex-1 min-h-0 bg-gray-950 overflow-hidden flex flex-col">
              <WordDefinitionPanel 
                 definition={selectedWord}
@@ -995,7 +932,6 @@ export default function App() {
 
         </div>
 
-        {/* BOTTOM CONTROLS */}
         <VideoControls 
            isPlaying={isPlaying}
            onPlayPause={togglePlayPause}
@@ -1016,14 +952,12 @@ export default function App() {
         />
       </div>
 
-      {/* RIGHT RESIZER */}
       <div 
         onMouseDown={startResizingRight}
         className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
         title="Drag to resize vocabulary"
       />
 
-      {/* RIGHT SIDEBAR: VOCABULARY */}
       {showVocabSidebar && (
         <div 
            style={{ width: rightPanelWidth }}
@@ -1035,7 +969,6 @@ export default function App() {
                  <h2 className="font-bold text-lg">Vocabulary</h2>
               </div>
               
-              {/* Settings Button (Moved here per previous request) */}
               <button
                   onClick={() => { setSettingsTab('local'); setIsSettingsOpen(true); }}
                   className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors"
