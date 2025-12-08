@@ -1,4 +1,4 @@
-import { SubtitleSegment, WordDefinition, LocalLLMConfig } from "../types";
+import { SubtitleSegment, WordDefinition, LocalLLMConfig, LocalASRConfig } from "../types";
 import { lookupWord, speakText } from "../utils/dictionary";
 import { GoogleGenAI, Type } from "@google/genai";
 import { extractAudioAsWav } from "./converterService";
@@ -370,6 +370,69 @@ const getLocalLLMDefinition = async (word: string, context: string, config: Loca
 };
 
 
+// --- LOCAL ASR (WHISPER) IMPLEMENTATION ---
+const generateSubtitlesLocalServer = async (audioData: Float32Array, config: LocalASRConfig): Promise<SubtitleSegment[]> => {
+    console.log("Using Local Whisper Server at:", config.endpoint);
+    
+    // 1. Convert float32 to WAV blob
+    const wavBuffer = encodeWAV(audioData, 16000);
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    const file = new File([blob], "audio.wav", { type: "audio/wav" });
+
+    // 2. Prepare FormData
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('model', 'whisper-1'); // Placeholder model name, often ignored or configurable
+
+    // 3. Fetch
+    try {
+        const response = await fetch(config.endpoint, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`Local Server Error (${response.status}): ${errText}`);
+        }
+
+        const data = await response.json();
+        
+        // Handle OpenAI format: { text: "...", segments: [...] }
+        if (data.segments && Array.isArray(data.segments)) {
+             return data.segments.map((s: any, i: number) => ({
+                 id: i,
+                 start: s.start,
+                 end: s.end,
+                 text: s.text.trim()
+             }));
+        } 
+        
+        // Handle simple text response (fallback)
+        if (data.text) {
+             console.warn("Local server returned text only, no segments. Creating single segment.");
+             return [{ id: 0, start: 0, end: 9999, text: data.text.trim() }];
+        }
+
+        return [];
+    } catch (e: any) {
+        console.error("Local Whisper Server Failed:", e);
+        // Check for specific network errors
+        if (e.name === 'TypeError' && e.message === 'Failed to fetch') {
+            throw new Error(
+                `Connection Failed to ${config.endpoint}.\n` +
+                `Possible causes:\n` +
+                `1. Server is not running or port is wrong.\n` +
+                `2. CORS is not enabled on your local server.\n` +
+                `3. Mixed Content Block: If this app is running on HTTPS, browsers block HTTP connections to localhost.\n` +
+                `   Solution: Run this app locally via localhost.`
+            );
+        }
+        throw e;
+    }
+};
+
+
 // --- MAIN EXPORTS (DISPATCHER) ---
 
 export const generateSubtitles = async (
@@ -377,10 +440,24 @@ export const generateSubtitles = async (
     onProgress: (segments: SubtitleSegment[]) => void,
     isOffline: boolean = true,
     modelId: string = 'Xenova/whisper-tiny',
-    apiKey?: string
+    apiKey?: string,
+    localASRConfig?: LocalASRConfig
 ): Promise<SubtitleSegment[]> => {
     
     if (isOffline) {
+        // CHECK LOCAL ASR FIRST
+        if (localASRConfig?.enabled && localASRConfig.endpoint) {
+             // Reset state logic usually handled by caller, but we can emit empty start
+             onProgress([]); 
+             
+             const audioData = await getAudioData(videoFile, true) as Float32Array;
+             const segments = await generateSubtitlesLocalServer(audioData, localASRConfig);
+             
+             onProgress(segments);
+             return segments;
+        }
+
+        // BROWSER WASM FALLBACK
         // Reset accumulation for new run
         accumulatedSegments = [];
         onSubtitleProgressCallback = onProgress;

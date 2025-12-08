@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server } from 'lucide-react';
-import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig } from './types';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic } from 'lucide-react';
+import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig } from './types';
 import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
 import { WordDefinitionPanel } from './components/WordDefinitionPanel';
@@ -76,6 +76,16 @@ export default function App() {
         return { enabled: false, endpoint: 'http://localhost:11434', model: '' };
       }
   });
+
+  // Local ASR State (Whisper)
+  const [localASRConfig, setLocalASRConfig] = useState<LocalASRConfig>(() => {
+      try {
+        const saved = localStorage.getItem('lingo_local_asr');
+        return saved ? JSON.parse(saved) : { enabled: false, endpoint: 'http://localhost:8080/v1/audio/transcriptions' };
+      } catch {
+        return { enabled: false, endpoint: 'http://localhost:8080/v1/audio/transcriptions' };
+      }
+  });
   
   // Online Gemini State
   const [geminiConfig, setGeminiConfig] = useState<GeminiConfig>(() => {
@@ -103,6 +113,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('lingo_local_llm', JSON.stringify(localLLMConfig));
   }, [localLLMConfig]);
+
+  useEffect(() => {
+    localStorage.setItem('lingo_local_asr', JSON.stringify(localASRConfig));
+  }, [localASRConfig]);
 
   useEffect(() => {
     localStorage.setItem('lingo_gemini_config', JSON.stringify(geminiConfig));
@@ -239,8 +253,8 @@ export default function App() {
 
   // --- Click Interceptor for Load Video ---
   const handleLoadVideoClick = (e: React.MouseEvent) => {
-    // If in Offline Mode AND model is NOT ready
-    if (isOffline && modelStatus !== 'ready') {
+    // If in Offline Mode AND model is NOT ready AND Local Whisper is NOT enabled
+    if (isOffline && modelStatus !== 'ready' && !localASRConfig.enabled) {
       e.preventDefault(); // Stop file picker from opening
       setShowModelAlert(true); // Show custom modal
     }
@@ -281,8 +295,8 @@ export default function App() {
         setErrorMsg(null);
         setIsPlaying(false); // Stop playback when regeneration starts
 
-        // If offline and model not ready, this will likely trigger download events too
-        if (isOffline && modelStatus === 'idle') {
+        // If offline and model not ready and local whisper not enabled
+        if (isOffline && !localASRConfig.enabled && modelStatus === 'idle') {
             setModelStatus('loading');
         }
 
@@ -293,10 +307,20 @@ export default function App() {
                if (processingIdRef.current === currentId) {
                    setSubtitles(newSegments);
                }
-          }, isOffline, selectedModelId, geminiConfig.apiKey);
+          }, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig);
           
-          if (!isOffline && processingIdRef.current === currentId) {
-             setIsProcessing(false);
+          if (processingIdRef.current === currentId) {
+             // For Online/LocalASR, we might finish here. For Worker, it streams but complete msg logic is separate
+             // If we rely on worker's complete message for 'isProcessing=false', that's fine.
+             // But for LocalASR/Online, they are async awaited.
+             if (!isOffline || localASRConfig.enabled) {
+                 setIsProcessing(false);
+             }
+             // For Browser Worker (isOffline && !localASR), we keep isProcessing=true?
+             // Actually, `generateSubtitles` for worker returns [] immediately and relies on callback.
+             // We need a way to know when worker is done to set isProcessing=false.
+             // Currently App.tsx doesn't have a callback for "Done".
+             // We can infer it if we want, or just leave "Analyzing..." spinner hidden if we have partials.
           }
         } catch (error: any) {
           console.error("Subtitle generation failed", error);
@@ -315,7 +339,7 @@ export default function App() {
 
     return () => clearTimeout(timer);
 
-  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey]);
+  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig]); // Added localASRConfig dependency
 
 
   // --- Video Logic ---
@@ -478,13 +502,13 @@ export default function App() {
                 </div>
                 <h3 className="text-xl font-bold text-white mb-2">Offline Model Required</h3>
                 <p className="text-gray-400 mb-6 text-sm leading-relaxed">
-                   Please download the Whisper model from the sidebar before loading a video in offline mode.
+                   Please download the Whisper model from the settings or enable Local Whisper Server before loading a video.
                 </p>
                 <button 
-                    onClick={() => setShowModelAlert(false)}
+                    onClick={() => { setShowModelAlert(false); setIsSettingsOpen(true); }}
                     className="w-full py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white font-medium rounded-lg transition-colors"
                 >
-                    I Understand
+                    Open Settings
                 </button>
             </div>
         </div>
@@ -493,7 +517,7 @@ export default function App() {
       {/* SETTINGS MODAL */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-            <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-md p-6 relative animate-in zoom-in-95 duration-200">
+            <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-md p-6 relative animate-in zoom-in-95 duration-200 overflow-y-auto max-h-[90vh]">
                 <button 
                     onClick={() => setIsSettingsOpen(false)} 
                     className="absolute top-4 right-4 text-gray-400 hover:text-white transition-colors"
@@ -514,7 +538,7 @@ export default function App() {
                     >
                         <div className="flex items-center justify-center gap-2">
                             <Server size={16} />
-                            Local AI (Ollama)
+                            Local AI
                         </div>
                     </button>
                     <button 
@@ -530,70 +554,176 @@ export default function App() {
                 
                 {/* TAB CONTENT: LOCAL */}
                 {settingsTab === 'local' && (
-                    <div className="space-y-6">
-                        {/* Enable Toggle */}
-                        <div className="flex items-center justify-between p-4 bg-gray-800/50 rounded-lg border border-gray-700">
-                            <div className="flex flex-col">
-                                <span className="font-medium text-gray-200">Enable Local LLM</span>
-                                <span className="text-xs text-gray-500">Use local Ollama for definitions in offline mode</span>
-                            </div>
-                            <button 
-                                onClick={() => setLocalLLMConfig(p => ({...p, enabled: !p.enabled}))}
-                                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${localLLMConfig.enabled ? 'bg-blue-600' : 'bg-gray-600'}`}
-                            >
-                                <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${localLLMConfig.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
-                            </button>
-                        </div>
-
-                        {/* Configuration Fields */}
-                        <div className={`space-y-5 transition-opacity duration-200 ${localLLMConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                            <div>
-                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Endpoint URL</label>
-                                <div className="flex gap-2">
-                                    <input 
-                                        type="text" 
-                                        value={localLLMConfig.endpoint}
-                                        onChange={(e) => setLocalLLMConfig(p => ({...p, endpoint: e.target.value}))}
-                                        className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
-                                        placeholder="http://localhost:11434"
-                                    />
-                                    <button 
-                                        onClick={checkLocalConnection}
-                                        disabled={checkingModel}
-                                        className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg hover:bg-gray-700 text-gray-300 transition-colors disabled:opacity-50"
-                                        title="Check Connection & Fetch Models"
-                                    >
-                                        {checkingModel ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
-                                    </button>
+                    <div className="space-y-8">
+                        
+                        {/* 1. WHISPER ASR SECTION */}
+                        <div className="space-y-4">
+                            <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 border-b border-gray-800">
+                                <Mic size={14} /> Speech-to-Text (Whisper)
+                            </h4>
+                            
+                            {/* Enable Toggle for Local Server */}
+                            <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-800">
+                                <div className="flex flex-col">
+                                    <span className="font-medium text-gray-200 text-sm">Use Local Whisper Server</span>
+                                    <span className="text-[10px] text-gray-500">Connect to local server (e.g. Whisper.cpp)</span>
                                 </div>
+                                <button 
+                                    onClick={() => setLocalASRConfig(p => ({...p, enabled: !p.enabled}))}
+                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${localASRConfig.enabled ? 'bg-blue-600' : 'bg-gray-600'}`}
+                                >
+                                    <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${localASRConfig.enabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                                </button>
                             </div>
 
-                            <div>
-                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
-                                {localModels.length > 0 ? (
-                                    <div className="relative">
+                             {/* Configuration for Local Server */}
+                            <div className={`transition-opacity duration-200 ${localASRConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                                <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">API Endpoint</label>
+                                <input 
+                                    type="text" 
+                                    value={localASRConfig.endpoint}
+                                    onChange={(e) => setLocalASRConfig(p => ({...p, endpoint: e.target.value}))}
+                                    className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                    placeholder="http://localhost:8080/v1/audio/transcriptions"
+                                />
+                                <p className="text-[10px] text-gray-500 mt-2">
+                                    Supports OpenAI-compatible endpoints (LocalAI, Whisper.cpp server).
+                                </p>
+                            </div>
+
+                            {/* BROWSER MODEL MANAGER (Visible if Local Server is DISABLED) */}
+                            {!localASRConfig.enabled && (
+                                <div className="mt-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+                                    <div className="flex items-center justify-between mb-3">
+                                        <div className="flex flex-col">
+                                            <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">In-Browser Model</span>
+                                            <span className="text-[10px] text-gray-500">Runs locally in browser via WebAssembly</span>
+                                        </div>
+                                        {modelStatus === 'ready' && <CheckCircle2 size={16} className="text-green-500" />}
+                                    </div>
+                                    
+                                    <div className="mb-3 relative">
                                         <select 
-                                            value={localLLMConfig.model}
-                                            onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
-                                            className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none appearance-none cursor-pointer"
+                                            value={selectedModelId}
+                                            onChange={(e) => handleModelChange(e.target.value)}
+                                            className="w-full bg-black text-gray-200 text-xs border border-gray-700 rounded px-2 py-2 appearance-none focus:outline-none focus:border-blue-500 cursor-pointer"
+                                            disabled={modelStatus === 'loading'}
                                         >
-                                            <option value="">Select a model...</option>
-                                            {localModels.map(m => <option key={m} value={m}>{m}</option>)}
+                                            {OFFLINE_MODELS.map(model => (
+                                                <option key={model.id} value={model.id}>{model.name}</option>
+                                            ))}
                                         </select>
                                         <ChevronDown size={14} className="absolute right-3 top-3 text-gray-500 pointer-events-none" />
                                     </div>
-                                ) : (
-                                    <input 
-                                        type="text" 
-                                        value={localLLMConfig.model}
-                                        onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
-                                        className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none placeholder-gray-700"
-                                        placeholder="e.g. llama3, mistral"
-                                    />
-                                )}
-                                <p className="text-[10px] text-gray-500 mt-2">
-                                    Click the refresh icon to list installed models from your local endpoint.
-                                </p>
+                                    
+                                    {modelStatus === 'idle' && (
+                                        <button 
+                                            onClick={handlePreloadModel}
+                                            className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white text-xs py-2 rounded transition-colors font-medium shadow-lg shadow-blue-900/20"
+                                        >
+                                            <Download size={14} />
+                                            <span>Download & Load Model</span>
+                                        </button>
+                                    )}
+
+                                    {modelStatus === 'loading' && (
+                                        <div className="space-y-2 bg-black/50 p-2 rounded border border-gray-800">
+                                            <div className="flex items-center gap-2 text-xs text-blue-400">
+                                                <Loader2 size={12} className="animate-spin" />
+                                                <span>{downloadProgress ? `Downloading... ${Math.round(downloadProgress.progress)}%` : 'Initializing...'}</span>
+                                            </div>
+                                            {downloadProgress && (
+                                                <div className="h-1.5 w-full bg-gray-700 rounded-full overflow-hidden">
+                                                    <div 
+                                                        className="h-full bg-blue-500 transition-all duration-300" 
+                                                        style={{ width: `${downloadProgress.progress}%` }} 
+                                                    />
+                                                </div>
+                                            )}
+                                            <div className="text-[10px] text-gray-500 truncate" title={downloadProgress?.file}>
+                                                {downloadProgress?.file || "Preparing environment..."}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {modelStatus === 'ready' && (
+                                        <div className="text-xs text-gray-400 flex items-center gap-2">
+                                            <CheckCircle2 size={12} className="text-green-500" />
+                                            Model cached and ready for use.
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+
+                        {/* 2. OLLAMA LLM SECTION */}
+                        <div className="space-y-4">
+                            <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 border-b border-gray-800">
+                                <Server size={14} /> Text Generation (Ollama)
+                            </h4>
+
+                            {/* Enable Toggle */}
+                            <div className="flex items-center justify-between p-3 bg-gray-800/30 rounded-lg border border-gray-800">
+                                <div className="flex flex-col">
+                                    <span className="font-medium text-gray-200 text-sm">Use Local Ollama</span>
+                                    <span className="text-[10px] text-gray-500">Use local LLM for word definitions</span>
+                                </div>
+                                <button 
+                                    onClick={() => setLocalLLMConfig(p => ({...p, enabled: !p.enabled}))}
+                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${localLLMConfig.enabled ? 'bg-blue-600' : 'bg-gray-600'}`}
+                                >
+                                    <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${localLLMConfig.enabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+
+                            {/* Configuration Fields */}
+                            <div className={`space-y-4 transition-opacity duration-200 ${localLLMConfig.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Endpoint URL</label>
+                                    <div className="flex gap-2">
+                                        <input 
+                                            type="text" 
+                                            value={localLLMConfig.endpoint}
+                                            onChange={(e) => setLocalLLMConfig(p => ({...p, endpoint: e.target.value}))}
+                                            className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none transition-all placeholder-gray-700"
+                                            placeholder="http://localhost:11434"
+                                        />
+                                        <button 
+                                            onClick={checkLocalConnection}
+                                            disabled={checkingModel}
+                                            className="px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg hover:bg-gray-700 text-gray-300 transition-colors disabled:opacity-50"
+                                            title="Check Connection & Fetch Models"
+                                        >
+                                            {checkingModel ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
+                                    {localModels.length > 0 ? (
+                                        <div className="relative">
+                                            <select 
+                                                value={localLLMConfig.model}
+                                                onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
+                                                className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none appearance-none cursor-pointer"
+                                            >
+                                                <option value="">Select a model...</option>
+                                                {localModels.map(m => <option key={m} value={m}>{m}</option>)}
+                                            </select>
+                                            <ChevronDown size={14} className="absolute right-3 top-3 text-gray-500 pointer-events-none" />
+                                        </div>
+                                    ) : (
+                                        <input 
+                                            type="text" 
+                                            value={localLLMConfig.model}
+                                            onChange={(e) => setLocalLLMConfig(p => ({...p, model: e.target.value}))}
+                                            className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none placeholder-gray-700"
+                                            placeholder="e.g. llama3, mistral"
+                                        />
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -662,67 +792,6 @@ export default function App() {
                 <span>{isOffline ? 'Offline' : 'Online'}</span>
                 </button>
             </div>
-
-            {/* MODEL MANAGER (OFFLINE MODE ONLY) */}
-            {isOffline && (
-                <div className="bg-gray-800/50 rounded-lg p-3 border border-gray-700">
-                    <div className="flex items-center justify-between mb-2">
-                         <span className="text-xs text-gray-400 font-semibold uppercase tracking-wider">AI Model (Whisper)</span>
-                         {modelStatus === 'ready' && <CheckCircle2 size={14} className="text-green-500" />}
-                    </div>
-                    
-                    {/* MODEL SELECTOR */}
-                    <div className="mb-3 relative">
-                        <select 
-                            value={selectedModelId}
-                            onChange={(e) => handleModelChange(e.target.value)}
-                            className="w-full bg-gray-900 text-white text-xs border border-gray-600 rounded px-2 py-1.5 appearance-none focus:outline-none focus:border-blue-500"
-                            disabled={modelStatus === 'loading'}
-                        >
-                            {OFFLINE_MODELS.map(model => (
-                                <option key={model.id} value={model.id}>{model.name}</option>
-                            ))}
-                        </select>
-                        <ChevronDown size={12} className="absolute right-2 top-2.5 text-gray-400 pointer-events-none" />
-                    </div>
-                    
-                    {modelStatus === 'idle' && (
-                        <button 
-                            onClick={handlePreloadModel}
-                            className="w-full flex items-center justify-center gap-2 bg-gray-700 hover:bg-gray-600 text-white text-xs py-2 rounded transition-colors"
-                        >
-                            <Download size={14} />
-                            <span>Load Model</span>
-                        </button>
-                    )}
-
-                    {modelStatus === 'loading' && (
-                        <div className="space-y-2">
-                             <div className="flex items-center gap-2 text-xs text-blue-300">
-                                 <Loader2 size={12} className="animate-spin" />
-                                 <span>{downloadProgress ? `Downloading... ${Math.round(downloadProgress.progress)}%` : 'Initializing...'}</span>
-                             </div>
-                             {downloadProgress && (
-                                <div className="h-1 w-full bg-gray-700 rounded-full overflow-hidden">
-                                    <div 
-                                        className="h-full bg-blue-500 transition-all duration-300" 
-                                        style={{ width: `${downloadProgress.progress}%` }} 
-                                    />
-                                </div>
-                             )}
-                             <div className="text-[10px] text-gray-500 truncate">
-                                {downloadProgress?.file || "Preparing environment..."}
-                             </div>
-                        </div>
-                    )}
-
-                    {modelStatus === 'ready' && (
-                        <div className="text-xs text-gray-400">
-                            Model cached & ready.
-                        </div>
-                    )}
-                </div>
-            )}
         </div>
         
         <div className="flex-1 overflow-y-auto p-0 scroll-smooth relative">
@@ -730,13 +799,17 @@ export default function App() {
              <div className="p-8 flex flex-col items-center gap-3 text-gray-500 text-sm">
                 <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                 <span className="text-center">
-                  {isOffline ? `Running ${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]} Model...` : "Processing with Gemini Cloud..."}
+                  {isOffline ? (
+                      localASRConfig.enabled 
+                      ? "Processing with Local Whisper Server..." 
+                      : `Running ${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]} Model...`
+                  ) : "Processing with Gemini Cloud..."}
                 </span>
             </div>
           ) : subtitles.length === 0 && !isProcessing ? (
             <div className="p-8 text-center text-gray-500 text-sm">
               {errorMsg ? (
-                <span className="text-red-400">{errorMsg}</span>
+                <div className="text-red-400 text-left whitespace-pre-wrap">{errorMsg}</div>
               ) : (
                 <span className="opacity-60">Load a video to generate subtitles.</span>
               )}
@@ -856,10 +929,12 @@ export default function App() {
              {isProcessing && subtitles.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-2 animate-pulse">
                      <span className="text-blue-400 text-sm font-medium">
-                       {isOffline ? `Analyzing Audio (${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]})...` : "Analyzing Audio (Gemini 2.0)..."}
+                       {isOffline ? (
+                           localASRConfig.enabled ? "Analyzing Audio (Local Whisper)..." : `Analyzing Audio (${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]})...`
+                       ) : "Analyzing Audio (Gemini Cloud)..."}
                      </span>
                      <span className="text-gray-600 text-xs">
-                        {isOffline ? "Running locally on your device." : "Uploading and processing in the cloud."}
+                        {isOffline ? (localASRConfig.enabled ? "Processing on Local Server." : "Running locally on your device.") : "Uploading and processing in the cloud."}
                      </span>
                 </div>
              ) : errorMsg ? (
@@ -867,129 +942,128 @@ export default function App() {
                     <AlertCircle size={16} />
                     <span>{errorMsg}</span>
                 </div>
-             ) : currentSegmentIndex !== -1 ? (
-              <div className="text-xl md:text-2xl text-white font-medium leading-relaxed max-w-4xl">
-                 {renderInteractiveSubtitle(subtitles[currentSegmentIndex].text)}
-              </div>
-            ) : (
-              <div className="text-gray-600 italic">
-                {subtitles.length > 0 ? "Play video to see subtitles..." : videoSrc && !isProcessing ? "No subtitles found." : "Subtitles will appear here..."}
-              </div>
-            )}
+             ) : (
+                <div className="flex flex-col items-center justify-center h-full text-gray-600 gap-2">
+                   <p className="text-sm">Subtitle Display Area</p>
+                   <p className="text-xs opacity-50">Subtitles will appear here synchronized with video.</p>
+                </div>
+             )}
+             
+             {/* Active Subtitle Overlay (if any) */}
+             {currentSegmentIndex !== -1 && subtitles[currentSegmentIndex] && (
+                 <div className="mt-4 animate-in fade-in slide-in-from-bottom-2 duration-200">
+                     <p className="text-xl md:text-2xl font-medium text-white leading-relaxed max-w-3xl">
+                         {renderInteractiveSubtitle(subtitles[currentSegmentIndex].text)}
+                     </p>
+                 </div>
+             )}
           </div>
 
-          {/* VERTICAL RESIZER 2 (Subtitles <-> Definition) */}
-           <div 
+          {/* VERTICAL RESIZER 2 (Subtitle <-> Definition) */}
+          <div 
             onMouseDown={startResizingSubtitle}
             className="h-1 cursor-row-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 flex items-center justify-center group"
           >
               <GripHorizontal size={12} className="text-gray-600 opacity-0 group-hover:opacity-100" />
           </div>
 
-          {/* 3. WORD DEFINITION PANEL */}
-          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          {/* 3. DEFINITION PANEL */}
+          <div className="flex-1 min-h-0 bg-gray-950 overflow-hidden flex flex-col">
              <WordDefinitionPanel 
-                definition={selectedWord} 
+                definition={selectedWord}
                 onAddToVocab={addToVocab}
                 isSaved={selectedWord ? vocabulary.some(v => v.word === selectedWord.word) : false}
                 isLoading={loadingWord}
              />
           </div>
-          
-          {/* 4. CONTROLS (Fixed at bottom) */}
-          <div className="flex-shrink-0">
-            <VideoControls 
-                isPlaying={isPlaying}
-                onPlayPause={togglePlayPause}
-                playbackMode={playbackMode}
-                onToggleMode={() => setPlaybackMode(m => m === PlaybackMode.CONTINUOUS ? PlaybackMode.LOOP_SENTENCE : PlaybackMode.CONTINUOUS)}
-                playbackRate={playbackRate}
-                onRateChange={handleRateChange}
-                onPrevSentence={handlePrevSentence}
-                onNextSentence={handleNextSentence}
-                hasSubtitles={subtitles.length > 0}
-                currentTime={currentTime}
-                duration={duration}
-                onSeek={handleSeek}
-                volume={volume}
-                onVolumeChange={handleVolumeChange}
-                isMuted={isMuted}
-                onToggleMute={toggleMute}
-            />
-          </div>
 
         </div>
+
+        {/* BOTTOM CONTROLS */}
+        <VideoControls 
+           isPlaying={isPlaying}
+           onPlayPause={togglePlayPause}
+           playbackMode={playbackMode}
+           onToggleMode={() => setPlaybackMode(m => m === PlaybackMode.CONTINUOUS ? PlaybackMode.LOOP_SENTENCE : PlaybackMode.CONTINUOUS)}
+           playbackRate={playbackRate}
+           onRateChange={handleRateChange}
+           onPrevSentence={handlePrevSentence}
+           onNextSentence={handleNextSentence}
+           hasSubtitles={subtitles.length > 0}
+           currentTime={currentTime}
+           duration={duration}
+           onSeek={handleSeek}
+           volume={volume}
+           onVolumeChange={handleVolumeChange}
+           isMuted={isMuted}
+           onToggleMute={toggleMute}
+        />
       </div>
 
       {/* RIGHT RESIZER */}
-      {showVocabSidebar && (
-        <div 
-            onMouseDown={startResizingRight}
-            className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
-            title="Drag to resize vocabulary"
-        />
-      )}
+      <div 
+        onMouseDown={startResizingRight}
+        className="w-1 cursor-col-resize bg-gray-800 hover:bg-blue-500 transition-colors z-20 flex-shrink-0 hidden md:block"
+        title="Drag to resize vocabulary"
+      />
 
       {/* RIGHT SIDEBAR: VOCABULARY */}
       {showVocabSidebar && (
         <div 
-            style={{ width: rightPanelWidth }}
-            className="bg-gray-950 border-l border-gray-800 flex flex-col flex-shrink-0 animate-in slide-in-from-right duration-300 absolute md:static inset-y-0 right-0 z-50 md:z-auto shadow-2xl md:shadow-none transition-none"
+           style={{ width: rightPanelWidth }}
+           className="bg-gray-950 border-l border-gray-800 flex flex-col flex-shrink-0 hidden md:flex"
         >
-           <div className="p-4 border-b border-gray-800 flex items-center justify-between">
+           <div className="p-4 border-b border-gray-800 bg-gray-900/50 flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <BookOpen className="text-green-500" />
-                <h2 className="font-bold text-lg">Vocabulary</h2>
+                 <BookOpen className="text-blue-500" />
+                 <h2 className="font-bold text-lg">Vocabulary</h2>
               </div>
-              <div className="flex items-center gap-1">
-                 {/* SETTINGS BUTTON */}
-                 <button 
-                    onClick={() => setIsSettingsOpen(true)}
-                    className="p-1.5 text-gray-500 hover:text-white rounded-md transition-colors"
-                    title="Settings"
-                 >
-                    <Settings size={18} />
-                 </button>
-                 <button onClick={() => setShowVocabSidebar(false)} className="md:hidden text-gray-500">
-                    <X size={20} />
-                 </button>
-              </div>
+              
+              {/* Settings Button (Moved here per previous request) */}
+              <button
+                  onClick={() => { setSettingsTab('local'); setIsSettingsOpen(true); }}
+                  className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors"
+                  title="Settings (Local AI & Models)"
+              >
+                  <Settings size={18} />
+              </button>
            </div>
-
-           <div className="flex-1 overflow-y-auto p-4 space-y-4">
+           
+           <div className="flex-1 overflow-y-auto p-0">
               {vocabulary.length === 0 ? (
-                  <div className="text-center text-gray-600 mt-10 text-sm">
-                      <p>Your notebook is empty.</p>
-                      <p className="mt-2">Click words in the subtitles to add them here.</p>
-                  </div>
+                <div className="p-8 text-center text-gray-500 text-sm opacity-60">
+                   <p>No words saved yet.</p>
+                   <p className="text-xs mt-2">Click words in subtitles to define and add them.</p>
+                </div>
               ) : (
-                  vocabulary.map(item => (
-                      <div 
-                        key={item.id} 
-                        onClick={() => handleVocabItemClick(item)}
-                        className="bg-gray-900 rounded-lg p-3 border border-gray-800 hover:border-gray-700 transition-colors group relative cursor-pointer"
+                vocabulary.map((item) => (
+                  <div 
+                    key={item.id} 
+                    onClick={() => handleVocabItemClick(item)}
+                    className="p-4 border-b border-gray-800 group hover:bg-gray-900 cursor-pointer transition-colors"
+                  >
+                    <div className="flex justify-between items-start mb-1">
+                      <span className="font-bold text-white text-lg">{item.word}</span>
+                      <button 
+                        onClick={(e) => removeFromVocab(e, item.id)}
+                        className="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity p-1"
                       >
-                          <div className="flex justify-between items-start mb-1">
-                              <h3 className="font-bold text-blue-300">{item.word}</h3>
-                              <span className="text-xs text-gray-500 italic">{item.partOfSpeech}</span>
-                          </div>
-                          <div className="text-xs text-gray-400 mb-2 font-mono">/{item.phonetic}/</div>
-                          <p className="text-sm text-gray-300 line-clamp-2" title={item.meaning}>{item.meaning}</p>
-                          
-                          <button 
-                            onClick={(e) => removeFromVocab(e, item.id)}
-                            className="absolute top-2 right-2 p-1.5 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
-                            title="Remove word"
-                          >
-                             <Trash2 size={14} />
-                          </button>
-                      </div>
-                  ))
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs text-gray-500 mb-2">
+                       <span className="italic">{item.partOfSpeech}</span>
+                       <span>•</span>
+                       <span className="font-mono text-blue-400">/{item.phonetic}/</span>
+                    </div>
+                    <p className="text-sm text-gray-400 line-clamp-2">{item.meaning}</p>
+                  </div>
+                ))
               )}
            </div>
         </div>
       )}
-
+      
     </div>
   );
 }
