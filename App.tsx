@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal } from 'lucide-react';
-import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig } from './types';
-import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels } from './services/geminiService';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical } from 'lucide-react';
+import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from './types';
+import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
 import { WordDefinitionPanel } from './components/WordDefinitionPanel';
 import { extractAudioAsWav } from './services/converterService';
@@ -47,6 +47,7 @@ export default function App() {
   // UI State
   const [isOffline, setIsOffline] = useState(true); // Default to offline
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<string>(''); // Detailed status
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [loadingWord, setLoadingWord] = useState(false);
   const [selectedWord, setSelectedWord] = useState<WordDefinition | null>(null);
@@ -67,6 +68,26 @@ export default function App() {
   // AI Configuration State
   const [settingsTab, setSettingsTab] = useState<'online' | 'local'>('local');
   
+  // Audio Segmentation State
+  const [segmentationMethod, setSegmentationMethod] = useState<SegmentationMethod>(() => {
+      try {
+          return (localStorage.getItem('lingo_segmentation') as SegmentationMethod) || 'fixed';
+      } catch {
+          return 'fixed';
+      }
+  });
+
+  const [vadSettings, setVadSettings] = useState<VADSettings>(() => {
+    try {
+        const saved = localStorage.getItem('lingo_vad_settings');
+        // Updated defaults: minSilence 0.4, silenceThreshold 0.03, filteringEnabled: true
+        const defaultSettings = { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.03, filteringEnabled: true };
+        return saved ? { ...defaultSettings, ...JSON.parse(saved) } : defaultSettings;
+    } catch {
+        return { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.03, filteringEnabled: true };
+    }
+  });
+
   // Local LLM State
   const [localLLMConfig, setLocalLLMConfig] = useState<LocalLLMConfig>(() => {
       try {
@@ -106,8 +127,9 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<'idle' | 'loading' | 'ready'>('idle');
   const [downloadProgress, setDownloadProgress] = useState<{ file: string; progress: number } | null>(null);
 
-  // Race condition protection
+  // Race condition protection & Audio Cache
   const processingIdRef = useRef(0);
+  const audioDataCacheRef = useRef<Float32Array | null>(null);
 
   // --- Settings Persistence ---
   useEffect(() => {
@@ -121,6 +143,14 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('lingo_gemini_config', JSON.stringify(geminiConfig));
   }, [geminiConfig]);
+
+  useEffect(() => {
+    localStorage.setItem('lingo_segmentation', segmentationMethod);
+  }, [segmentationMethod]);
+
+  useEffect(() => {
+    localStorage.setItem('lingo_vad_settings', JSON.stringify(vadSettings));
+  }, [vadSettings]);
 
   // --- Resizing Logic ---
   const startResizingLeft = useCallback(() => {
@@ -293,75 +323,105 @@ export default function App() {
     setIsPlaying(false);
     setErrorMsg(null); // Clear previous errors
     
+    // Clear Audio Cache on new file
+    audioDataCacheRef.current = null;
+    
     // Set video source for the player
     const url = URL.createObjectURL(file);
     setVideoSrc(url);
     
-    // Update file state - this will trigger the useEffect to start processing
+    // Update file state - this will trigger the useEffect to reset
     setVideoFile(file);
   };
 
-  // Effect to handle Subtitle Generation (Runs on new file OR mode switch OR model switch)
+  // EFFECT: RESET ON NEW VIDEO (No Auto Generate)
   useEffect(() => {
+    if (videoFile) {
+        setSubtitles([]);
+        setCurrentSegmentIndex(-1);
+        setSelectedWord(null);
+        setErrorMsg(null);
+        setIsProcessing(false);
+        setProcessingStatus(''); // Clear status
+        setIsPlaying(false);
+    }
+  }, [videoFile]);
+
+  // Handle Manual Generation
+  const handleGenerate = async (testMode: boolean = false) => {
     if (!videoFile) return;
 
     const currentId = processingIdRef.current + 1;
     processingIdRef.current = currentId;
 
-    const processVideoForSubtitles = async () => {
-        // Reset UI for processing state
-        setSubtitles([]);
-        setCurrentSegmentIndex(-1);
-        setSelectedWord(null);
-        setIsProcessing(true);
-        setErrorMsg(null);
-        setIsPlaying(false); // Stop playback when regeneration starts
+    // Reset UI for processing state
+    setSubtitles([]);
+    setCurrentSegmentIndex(-1);
+    setSelectedWord(null);
+    setIsProcessing(true);
+    setProcessingStatus('Initializing...');
+    setErrorMsg(null);
+    setIsPlaying(false);
 
-        // If offline and model not ready and local whisper not enabled
-        if (isOffline && !localASRConfig.enabled && modelStatus === 'idle') {
-            setModelStatus('loading');
-        }
+    // If offline and model not ready and local whisper not enabled
+    if (isOffline && !localASRConfig.enabled && modelStatus === 'idle') {
+        setModelStatus('loading');
+    }
 
-        try {
-          // Pass the API key if online
-          await generateSubtitles(videoFile, (newSegments) => {
-               // Only update if this request is still the active one
-               if (processingIdRef.current === currentId) {
-                   setSubtitles(newSegments);
-               }
-          }, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig);
-          
-          if (processingIdRef.current === currentId) {
-             // For Online/LocalASR, we might finish here. For Worker, it streams but complete msg logic is separate
-             // If we rely on worker's complete message for 'isProcessing=false', that's fine.
-             // But for LocalASR/Online, they are async awaited.
-             if (!isOffline || localASRConfig.enabled) {
-                 setIsProcessing(false);
+    try {
+        // --- AUDIO CACHING STRATEGY ---
+        let audioDataForProcess = audioDataCacheRef.current;
+        
+        // If no cache, decode now
+        if (!audioDataForProcess) {
+             setProcessingStatus('Decoding Audio (Full File)...');
+             // We use 'true' for 'forOffline' because we always want raw float32 for caching/VAD, 
+             // regardless of mode (Online mode logic will re-encode to WAV if needed inside generateSubtitles)
+             const decoded = await getAudioData(videoFile, true);
+             if (typeof decoded !== 'string') {
+                 audioDataForProcess = decoded;
+                 audioDataCacheRef.current = decoded;
              }
-             // For Browser Worker (isOffline && !localASR), we keep isProcessing=true?
-             // Actually, `generateSubtitles` for worker returns [] immediately and relies on callback.
-             // We need a way to know when worker is done to set isProcessing=false.
-             // Currently App.tsx doesn't have a callback for "Done".
-             // We can infer it if we want, or just leave "Analyzing..." spinner hidden if we have partials.
-          }
-        } catch (error: any) {
-          console.error("Subtitle generation failed", error);
-          if (processingIdRef.current === currentId) {
-              // Show the specific error from service (e.g. "Browser cannot decode...")
-              setErrorMsg(error.message || `Could not generate subtitles (${isOffline ? 'Offline' : 'Online'}).`);
-              setIsProcessing(false);
-          }
         }
-    };
 
-    // Small timeout to ensure UI updates state before heavy processing starts
-    const timer = setTimeout(() => {
-        processVideoForSubtitles();
-    }, 100);
-
-    return () => clearTimeout(timer);
-
-  }, [videoFile, isOffline, selectedModelId, geminiConfig.apiKey, localASRConfig]); // Added localASRConfig dependency
+        await generateSubtitles(
+            videoFile, 
+            (newSegments) => {
+                // Only update if this request is still the active one
+                if (processingIdRef.current === currentId) {
+                    setSubtitles(newSegments);
+                }
+            }, 
+            isOffline, 
+            selectedModelId, 
+            geminiConfig.apiKey, 
+            localASRConfig, 
+            segmentationMethod, 
+            vadSettings,
+            testMode,
+            audioDataForProcess, // Pass cached data
+            (status) => {
+                if (processingIdRef.current === currentId) {
+                    setProcessingStatus(status);
+                }
+            }
+        );
+        
+        if (processingIdRef.current === currentId) {
+            if (!isOffline || localASRConfig.enabled) {
+                setIsProcessing(false);
+                setProcessingStatus('');
+            }
+        }
+    } catch (error: any) {
+        console.error("Subtitle generation failed", error);
+        if (processingIdRef.current === currentId) {
+            setErrorMsg(error.message || `Could not generate subtitles (${isOffline ? 'Offline' : 'Online'}).`);
+            setIsProcessing(false);
+            setProcessingStatus('');
+        }
+    }
+  };
 
 
   // --- Video Logic ---
@@ -574,6 +634,108 @@ export default function App() {
                     </button>
                 </div>
                 
+                {/* GLOBAL: AUDIO SEGMENTATION SETTINGS */}
+                <div className="mb-8 border-b border-gray-800 pb-6">
+                     <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 mb-3">
+                        <Scissors size={14} /> Audio Segmentation
+                    </h4>
+                    <div className="grid grid-cols-2 gap-3 mb-4">
+                        <button
+                            onClick={() => setSegmentationMethod('fixed')}
+                            className={`flex flex-col items-center justify-center p-3 rounded-lg border text-center transition-all ${
+                                segmentationMethod === 'fixed' 
+                                ? 'bg-blue-900/30 border-blue-500 text-blue-300' 
+                                : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-750'
+                            }`}
+                        >
+                            <span className="font-semibold text-xs mb-1">Progressive (Fixed)</span>
+                            <span className="text-[10px] opacity-70">Manual splits (20s, 60s...) for faster initial load.</span>
+                        </button>
+
+                        <button
+                            onClick={() => setSegmentationMethod('vad')}
+                            className={`flex flex-col items-center justify-center p-3 rounded-lg border text-center transition-all ${
+                                segmentationMethod === 'vad' 
+                                ? 'bg-blue-900/30 border-blue-500 text-blue-300' 
+                                : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-750'
+                            }`}
+                        >
+                            <span className="font-semibold text-xs mb-1">VAD (Auto)</span>
+                            <span className="text-[10px] opacity-70">Detects silence to split audio at sentence breaks.</span>
+                        </button>
+                    </div>
+                    
+                    {/* VAD SETTINGS */}
+                    {segmentationMethod === 'vad' && (
+                        <div className="space-y-4 px-1">
+                            <div>
+                                <div className="flex justify-between items-center mb-1">
+                                    <label className="text-xs font-bold text-gray-500 uppercase">Pre-split Batch Duration</label>
+                                    <span className="text-xs text-blue-400 font-mono">{vadSettings.batchSize}s</span>
+                                </div>
+                                <input 
+                                    type="range" 
+                                    min="10" 
+                                    max="600" 
+                                    step="10"
+                                    value={vadSettings.batchSize}
+                                    onChange={(e) => setVadSettings(p => ({ ...p, batchSize: parseInt(e.target.value) }))}
+                                    className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                />
+                                <p className="text-[10px] text-gray-500 mt-1">Processing window size. Larger = better context but slower updates.</p>
+                            </div>
+                            
+                            <div>
+                                <div className="flex justify-between items-center mb-1">
+                                    <label className="text-xs font-bold text-gray-500 uppercase">Min Silence Duration</label>
+                                    <span className="text-xs text-blue-400 font-mono">{vadSettings.minSilence}s</span>
+                                </div>
+                                <input 
+                                    type="range" 
+                                    min="0.1" 
+                                    max="1.0" 
+                                    step="0.05"
+                                    value={vadSettings.minSilence}
+                                    onChange={(e) => setVadSettings(p => ({ ...p, minSilence: parseFloat(e.target.value) }))}
+                                    className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                />
+                                <p className="text-[10px] text-gray-500 mt-1">Minimum silence required to trigger a split.</p>
+                            </div>
+
+                            <div>
+                                <div className="flex justify-between items-center mb-1">
+                                    <label className="text-xs font-bold text-gray-500 uppercase">Silence Threshold</label>
+                                    <span className="text-xs text-blue-400 font-mono">{vadSettings.silenceThreshold}</span>
+                                </div>
+                                <input 
+                                    type="range" 
+                                    min="0.001" 
+                                    max="0.05" 
+                                    step="0.001"
+                                    value={vadSettings.silenceThreshold}
+                                    onChange={(e) => setVadSettings(p => ({ ...p, silenceThreshold: parseFloat(e.target.value) }))}
+                                    className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                />
+                                <p className="text-[10px] text-gray-500 mt-1">Sensitivity. Lower = cleaner audio needed. Higher = tolerates noise.</p>
+                            </div>
+
+                            {/* Filtering Toggle */}
+                             <div className="flex items-center justify-between pt-2 border-t border-gray-800 mt-2">
+                                <div>
+                                    <div className="text-xs font-bold text-gray-500 uppercase">Vocal Filtering</div>
+                                    <p className="text-[10px] text-gray-500">Band-pass filter (150-3000Hz) to isolate voice.</p>
+                                </div>
+                                <button 
+                                    onClick={() => setVadSettings(p => ({...p, filteringEnabled: !p.filteringEnabled}))}
+                                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${vadSettings.filteringEnabled ? 'bg-blue-600' : 'bg-gray-700'}`}
+                                >
+                                    <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${vadSettings.filteringEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
                 {/* TAB CONTENT: LOCAL */}
                 {settingsTab === 'local' && (
                     <div className="space-y-8">
@@ -873,6 +1035,27 @@ export default function App() {
                 <span>{isOffline ? 'Offline' : 'Online'}</span>
                 </button>
             </div>
+            
+            {/* ACTION BUTTONS */}
+            <div className="flex items-center gap-2">
+                <button 
+                    onClick={() => handleGenerate(false)}
+                    disabled={isProcessing || !videoFile}
+                    className="flex-1 flex items-center justify-center gap-2 py-2 px-3 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-500 text-white text-xs font-bold rounded transition-colors shadow-lg shadow-blue-900/20"
+                >
+                    {isProcessing ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
+                    <span>Generate</span>
+                </button>
+                <button 
+                    onClick={() => handleGenerate(true)}
+                    disabled={isProcessing || !videoFile || segmentationMethod !== 'vad'}
+                    title={segmentationMethod !== 'vad' ? "Enable VAD mode in settings to test" : "Generate only the first batch (e.g. 2 mins)"}
+                    className="flex-1 flex items-center justify-center gap-2 py-2 px-3 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-300 text-xs font-bold rounded transition-colors border border-gray-700"
+                >
+                    <FlaskConical size={14} />
+                    <span>Test VAD</span>
+                </button>
+            </div>
         </div>
         
         <div className="flex-1 overflow-y-auto p-0 scroll-smooth relative">
@@ -880,11 +1063,18 @@ export default function App() {
              <div className="p-8 flex flex-col items-center gap-3 text-gray-500 text-sm">
                 <div className="w-5 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                 <span className="text-center">
-                  {isOffline ? (
-                      localASRConfig.enabled 
-                      ? "Processing with Local Whisper Server..." 
-                      : `Running ${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]} Model...`
-                  ) : "Processing with Gemini Cloud..."}
+                  {processingStatus ? (
+                      <span className="text-blue-400 font-medium animate-pulse">{processingStatus}</span>
+                  ) : (
+                      isOffline ? (
+                          localASRConfig.enabled 
+                          ? "Processing with Local Whisper Server..." 
+                          : `Running ${OFFLINE_MODELS.find(m => m.id === selectedModelId)?.name.split(' ')[0]} Model...`
+                      ) : "Processing with Gemini Cloud..."
+                  )}
+                </span>
+                <span className="text-xs text-gray-600 mt-1">
+                    {segmentationMethod === 'vad' ? "Using Smart VAD Splitting" : "Using Progressive Splitting"}
                 </span>
             </div>
           ) : subtitles.length === 0 && !isProcessing ? (
@@ -892,7 +1082,9 @@ export default function App() {
               {errorMsg ? (
                 <div className="text-red-400 text-left whitespace-pre-wrap">{errorMsg}</div>
               ) : (
-                <span className="opacity-60">Load a video to generate subtitles.</span>
+                <span className="opacity-60">
+                    {videoFile ? "Ready to generate." : "Load a video to start."}
+                </span>
               )}
             </div>
           ) : (

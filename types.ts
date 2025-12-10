@@ -40,6 +40,15 @@ export interface GeminiConfig {
   apiKey: string;
 }
 
+export type SegmentationMethod = 'fixed' | 'vad';
+
+export interface VADSettings {
+  batchSize: number; // Seconds (e.g. 120)
+  minSilence: number; // Seconds (e.g. 0.2)
+  silenceThreshold: number; // Amplitude (e.g. 0.01)
+  filteringEnabled: boolean; // Enable/Disable band-pass filter
+}
+
 // Worker Types
 export interface WorkerMessage {
   type: 'load' | 'generate' | 'ready' | 'update' | 'complete' | 'error';

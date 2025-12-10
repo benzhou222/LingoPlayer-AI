@@ -1,4 +1,4 @@
-import { SubtitleSegment, WordDefinition, LocalLLMConfig, LocalASRConfig } from "../types";
+import { SubtitleSegment, WordDefinition, LocalLLMConfig, LocalASRConfig, SegmentationMethod, VADSettings } from "../types";
 import { GoogleGenAI, Type } from "@google/genai";
 import { extractAudioAsWav } from "./converterService";
 import { lookupWord, speakText } from "../utils/dictionary";
@@ -16,11 +16,9 @@ class PipelineFactory {
 
     static async getInstance(modelId, progress_callback = null) {
         if (!this.instances[modelId]) {
-            console.log("Loading Whisper model: " + modelId);
             this.instances[modelId] = await pipeline(this.task, modelId, {
                 progress_callback
             });
-            console.log("Whisper model loaded: " + modelId);
         }
         return this.instances[modelId];
     }
@@ -43,12 +41,13 @@ self.onmessage = async (event) => {
     }
 
     if (message.type === 'generate') {
-        const { audio, model, jobId } = message.data;
+        const { audio, model, jobId, timeOffset: globalTimeOffset } = message.data;
         // Whisper expects 16kHz audio
         const SAMPLE_RATE = 16000;
         // Process in 30-second chunks (standard Whisper window)
         const CHUNK_LENGTH_S = 30;
         const CHUNK_SIZE = CHUNK_LENGTH_S * SAMPLE_RATE;
+        const globalOffset = globalTimeOffset || 0;
         
         try {
             const transcriber = await PipelineFactory.getInstance(model, (data) => {
@@ -63,26 +62,11 @@ self.onmessage = async (event) => {
                 const endSamples = Math.min(offsetSamples + CHUNK_SIZE, totalSamples);
                 const chunk = audio.slice(offsetSamples, endSamples);
                 
-                // Adjust timestamps relative to the whole file
-                const timeOffset = offsetSamples / SAMPLE_RATE;
-
-                // LOGGING REQUEST: Split 0-20s, 20s-1m, 1m-3m
-                let logPrefixReq = "";
-                if (timeOffset < 20) logPrefixReq = "[Worker Request 0-20s]";
-                else if (timeOffset < 60) logPrefixReq = "[Worker Request 20s-1m]";
-                else if (timeOffset < 180) logPrefixReq = "[Worker Request 1m-3m]";
-
-                if (logPrefixReq) {
-                    console.log(\`\${logPrefixReq} Processing Chunk starting at \${timeOffset.toFixed(2)}s\`, {
-                        inputSampleCount: chunk.length,
-                        model: model,
-                        language: 'english'
-                    });
-                }
+                // Adjust timestamps relative to the whole file (plus global offset if streaming)
+                const currentChunkOffset = offsetSamples / SAMPLE_RATE;
+                const totalOffset = globalOffset + currentChunkOffset;
                 
                 // Run inference on this chunk
-                // We don't use the pipeline's built-in chunking/stride for the whole file 
-                // because we want immediate partial feedback.
                 const output = await transcriber(chunk, {
                     language: 'english',
                     return_timestamps: true,
@@ -90,23 +74,13 @@ self.onmessage = async (event) => {
 
                 
                 const adjustedChunks = (output.chunks || []).map(c => {
-                    const start = (c.timestamp[0] === null ? 0 : c.timestamp[0]) + timeOffset;
-                    const end = (c.timestamp[1] === null ? start + 2 : c.timestamp[1]) + timeOffset;
+                    const start = (c.timestamp[0] === null ? 0 : c.timestamp[0]) + totalOffset;
+                    const end = (c.timestamp[1] === null ? start + 2 : c.timestamp[1]) + totalOffset;
                     return {
                         text: c.text,
                         timestamp: [start, end]
                     };
                 });
-
-                // LOGGING RESPONSE: Split 0-20s, 20s-1m, 1m-3m
-                let logPrefixRes = "";
-                if (timeOffset < 20) logPrefixRes = "[Worker Response 0-20s]";
-                else if (timeOffset < 60) logPrefixRes = "[Worker Response 20s-1m]";
-                else if (timeOffset < 180) logPrefixRes = "[Worker Response 1m-3m]";
-
-                if (logPrefixRes) {
-                    console.log(\`\${logPrefixRes} Chunk starting at \${timeOffset.toFixed(2)}s data:\`, adjustedChunks);
-                }
 
                 // Emit partial results immediately with jobId
                 self.postMessage({ type: 'partial', data: adjustedChunks, jobId });
@@ -176,7 +150,6 @@ const initWorker = () => {
         if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
       } 
       else if (type === 'error') {
-        console.error("Worker Error:", data);
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'error', error: data });
         if (!data.file && typeof data === 'string') alert("Offline AI Error: " + data); 
       }
@@ -186,7 +159,7 @@ const initWorker = () => {
 };
 
 // --- AUDIO UTILITIES ---
-const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float32Array | string> => {
+export const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float32Array | string> => {
     try {
         const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         const arrayBuffer = await videoFile.arrayBuffer();
@@ -201,7 +174,6 @@ const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float
                 return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
             }
         } catch (decodeError) {
-            console.warn("Native decoding failed, trying FFmpeg fallback...", decodeError);
             const pcmData = await extractAudioAsWav(videoFile);
             if (forOffline) {
                 return pcmData;
@@ -211,7 +183,6 @@ const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float
             }
         }
     } catch (e: any) {
-        console.error("All audio decoding methods failed:", e);
         throw new Error(e.message || "Unable to decode audio data. The file format might be corrupted or unsupported.");
     }
 };
@@ -291,72 +262,329 @@ function parseTimestamp(val: any): number {
 }
 
 // Deterministic, calculation-based method to determine timestamp units.
-// Avoids estimation by validating against physical speech constraints and chunk limits.
 function detectTimeScale(segments: any[], chunkDuration: number): number {
-    // 1. Pre-process and calculate internal durations
     const parsed = segments.map(s => {
         const start = parseTimestamp(s.start);
         const end = parseTimestamp(s.end);
         return { start, end, dur: end - start };
     }).filter(s => s.end > s.start && s.dur > 0);
 
-    // If no valid segments, assume standard seconds
     if (parsed.length === 0) return 1.0;
-
-    // Calculate Average Duration of segments in raw units
     const avgDur = parsed.reduce((sum, s) => sum + s.dur, 0) / parsed.length;
-    
-    // Calculate Max Timestamp in raw units
     const maxEnd = Math.max(...parsed.map(s => s.end));
-
-    // Candidates: Seconds (1.0), Centiseconds (0.01), Milliseconds (0.001)
     const candidates = [1.0, 0.01, 0.001];
 
-    // Filter candidates based on Strict Constraints
     const validCandidates = candidates.filter(scale => {
         const scaledAvg = avgDur * scale;
         const scaledMax = maxEnd * scale;
-
-        // Constraint 1: "Speech Physics"
-        // A single subtitle segment is typically between 0.2s (a word) and 15s (a long sentence).
-        // We allow up to 30s to be extremely generous for run-on sentences, but anything beyond that is likely a scale error.
-        // e.g. if unit is ms, but we treat as s -> 2500s average duration -> invalid.
-        // e.g. if unit is s, but we treat as ms -> 0.0025s average duration -> invalid.
         const isDurationReasonable = scaledAvg >= 0.2 && scaledAvg <= 30.0;
-
-        // Constraint 2: "Chunk Bounds"
-        // The timestamps cannot exceed the chunk duration significantly.
-        // We allow a 50% buffer for model drift/hallucination, but not orders of magnitude.
         const fitsInChunk = scaledMax <= (chunkDuration * 1.5);
-
         return isDurationReasonable && fitsInChunk;
     });
 
-    console.log(`[Timestamp Calc] RawAvg: ${avgDur}, RawMax: ${maxEnd}, ChunkDur: ${chunkDuration}. Valid Scales: ${validCandidates.join(', ')}`);
-
-    // Decision Logic
-    if (validCandidates.length === 1) {
-        return validCandidates[0];
-    }
-
+    if (validCandidates.length === 1) return validCandidates[0];
     if (validCandidates.length > 1) {
-        // If multiple are valid (unlikely, e.g. seconds vs centiseconds?), 
-        // pick the one whose average duration is closest to 3.0 seconds (standard sentence).
         return validCandidates.sort((a, b) => {
             const distA = Math.abs((avgDur * a) - 3.0);
             const distB = Math.abs((avgDur * b) - 3.0);
             return distA - distB;
         })[0];
     }
-
-    // Fallback: If NONE are valid (e.g. model hallucinated wild timestamps),
-    // pick the one that at least fits inside the chunk duration best.
     return candidates.sort((a, b) => {
          const distA = Math.abs((maxEnd * a) - chunkDuration);
          const distB = Math.abs((maxEnd * b) - chunkDuration);
          return distA - distB;
     })[0];
 }
+
+// --- CHUNK GENERATION UTILS (FIXED vs VAD) ---
+
+interface ChunkDefinition {
+    index: number;
+    start: number;
+    end: number;
+}
+
+// 1. RMS Calculation
+const calculateRMS = (buffer: Float32Array): number => {
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i++) {
+        sum += buffer[i] * buffer[i];
+    }
+    return Math.sqrt(sum / buffer.length);
+};
+
+// 2. Band-Pass Filter (Isolate Vocals)
+// 80Hz HPF + 3000Hz LPF
+const applyVocalFilter = (audio: Float32Array, sampleRate: number): Float32Array => {
+    const filtered = new Float32Array(audio.length);
+    const dt = 1 / sampleRate;
+    
+    // High Pass (80Hz) - Remove rumble
+    const rc_hp = 1 / (2 * Math.PI * 80);
+    const alpha_hp = rc_hp / (rc_hp + dt);
+    
+    // Low Pass (3000Hz) - Remove hiss
+    const rc_lp = 1 / (2 * Math.PI * 3000);
+    const alpha_lp = dt / (rc_lp + dt);
+
+    let lastIn = 0;
+    let lastOutHp = 0;
+    let lastOutLp = 0;
+
+    for (let i = 0; i < audio.length; i++) {
+        // HPF
+        const hp = alpha_hp * (lastOutHp + audio[i] - lastIn);
+        lastIn = audio[i];
+        lastOutHp = hp;
+
+        // LPF
+        const lp = lastOutLp + alpha_lp * (hp - lastOutLp);
+        filtered[i] = lp;
+        lastOutLp = lp;
+    }
+    
+    return filtered;
+};
+
+// 3. VAD Scan (Find split points in a buffer)
+const scanForSplitPoints = (
+    audio: Float32Array, 
+    sampleRate: number, 
+    minSilenceSec: number, 
+    threshold: number
+): number[] => {
+    const splitPoints: number[] = [];
+    const windowSize = Math.floor(sampleRate * 0.05); // 50ms analysis window
+    const minSilenceSamples = minSilenceSec * sampleRate;
+    
+    let currentSilenceSamples = 0;
+    let silenceStartIndex = -1;
+
+    for (let i = 0; i < audio.length; i += windowSize) {
+        const end = Math.min(i + windowSize, audio.length);
+        const window = audio.subarray(i, end);
+        const rms = calculateRMS(window);
+
+        if (rms < threshold) {
+            // Silence detected
+            if (currentSilenceSamples === 0) {
+                silenceStartIndex = i;
+            }
+            currentSilenceSamples += (end - i);
+        } else {
+            // Speech detected - check if previous silence was a valid split point
+            if (currentSilenceSamples >= minSilenceSamples) {
+                // Split in the middle of the silence
+                const splitPoint = silenceStartIndex + Math.floor(currentSilenceSamples / 2);
+                splitPoints.push(splitPoint);
+            }
+            // Reset
+            currentSilenceSamples = 0;
+            silenceStartIndex = -1;
+        }
+    }
+
+    // Handle trailing silence if valid
+    if (currentSilenceSamples >= minSilenceSamples) {
+         const splitPoint = silenceStartIndex + Math.floor(currentSilenceSamples / 2);
+         splitPoints.push(splitPoint);
+    }
+
+    return splitPoints;
+};
+
+// 4. Main VAD Generator (Pre-Split -> Filter -> VAD)
+function* getVADChunks(
+    audioData: Float32Array, 
+    sampleRate: number, 
+    batchSizeSec: number, 
+    minSilenceSec: number, 
+    silenceThreshold: number, 
+    filteringEnabled: boolean, 
+    limitSec?: number
+): Generator<ChunkDefinition> {
+    console.log(`%c[VAD] Starting VAD Process. Total Duration: ${(audioData.length / sampleRate).toFixed(2)}s`, "color: #4ade80; font-weight: bold;");
+    console.log(`%c[VAD] Settings: Batch=${batchSizeSec}s | MinSilence=${minSilenceSec}s | Threshold=${silenceThreshold} | Filter=${filteringEnabled}`, "color: #60a5fa");
+
+    const BATCH_SAMPLES = batchSizeSec * sampleRate;
+    let filePointer = 0;
+    let globalIndex = 0;
+    
+    // Buffer to hold audio that needs processing (including carried over audio)
+    let buffer: Float32Array = new Float32Array(0);
+    // Track the global start time of the current buffer
+    let bufferGlobalStart = 0;
+
+    while (filePointer < audioData.length) {
+        if (limitSec !== undefined && (filePointer / sampleRate) >= limitSec) {
+             console.log(`%c[VAD] Test Limit (${limitSec}s) reached. Stopping.`, "color: orange");
+             break;
+        }
+
+        // --- STEP 1: PRE-SPLIT (Batching) ---
+        const batchEnd = Math.min(filePointer + BATCH_SAMPLES, audioData.length);
+        const newBatch = audioData.slice(filePointer, batchEnd);
+        
+        console.group(`[VAD] Processing Batch ${(filePointer/sampleRate).toFixed(2)}s - ${(batchEnd/sampleRate).toFixed(2)}s`);
+        
+        // Merge leftover buffer with new batch
+        const combined = new Float32Array(buffer.length + newBatch.length);
+        combined.set(buffer);
+        combined.set(newBatch, buffer.length);
+        buffer = combined;
+        // bufferGlobalStart is already correct (points to start of leftover)
+        
+        console.log(`Buffer size: ${(buffer.length/sampleRate).toFixed(2)}s (Leftover + New Batch)`);
+
+        // --- STEP 2: FILTERING ---
+        let analysisBuffer = buffer;
+        if (filteringEnabled) {
+            console.log(`Applying Band-Pass Filter (80Hz - 3000Hz)...`);
+            analysisBuffer = applyVocalFilter(buffer, sampleRate);
+        } else {
+            console.log(`Filtering Disabled. Analyzing Raw Audio.`);
+        }
+
+        // --- STEP 3: VAD SCAN ---
+        console.log(`Scanning for silence (Threshold: ${silenceThreshold}, Min: ${minSilenceSec}s)...`);
+        const splitIndices = scanForSplitPoints(analysisBuffer, sampleRate, minSilenceSec, silenceThreshold);
+        console.log(`Found ${splitIndices.length} split points.`);
+
+        // --- STEP 4: YIELD CHUNKS ---
+        let lastSplitLocal = 0;
+        
+        for (const splitPoint of splitIndices) {
+            const startLocal = lastSplitLocal;
+            const endLocal = splitPoint;
+            
+            // Validate chunk size (avoid < 0.2s unless it's the only option)
+            const dur = (endLocal - startLocal) / sampleRate;
+            
+            if (dur > 0.2) {
+                const globalStart = bufferGlobalStart + startLocal;
+                const globalEnd = bufferGlobalStart + endLocal;
+                
+                console.log(`Yielding Chunk #${globalIndex}: ${globalStart/sampleRate}s -> ${globalEnd/sampleRate}s (${dur.toFixed(2)}s)`);
+                
+                yield {
+                    index: globalIndex++,
+                    start: globalStart,
+                    end: globalEnd
+                };
+            } else {
+                console.debug(`Skipping micro-chunk (<0.2s): ${dur.toFixed(3)}s`);
+            }
+            
+            lastSplitLocal = endLocal;
+        }
+
+        // --- STEP 5: HANDLE LEFTOVERS ---
+        const isEOF = batchEnd >= audioData.length;
+        const isLimitReached = limitSec !== undefined && (batchEnd / sampleRate) >= limitSec;
+        
+        // Calculate remaining audio in buffer
+        const leftoverSamples = buffer.length - lastSplitLocal;
+
+        if (isEOF || isLimitReached) {
+            // Flush Everything
+            if (leftoverSamples > 0) {
+                 const globalStart = bufferGlobalStart + lastSplitLocal;
+                 const globalEnd = bufferGlobalStart + buffer.length;
+                 console.log(`EOF: Flushing final chunk: ${globalStart/sampleRate}s -> ${globalEnd/sampleRate}s`);
+                 yield {
+                    index: globalIndex++,
+                    start: globalStart,
+                    end: globalEnd
+                 };
+            }
+            buffer = new Float32Array(0);
+        } else {
+            // Check if buffer is getting dangerously large (no silence found)
+            // e.g., if buffer > 3 * batchSize, we must cut forcefully to avoid memory issues or hanging
+            const MAX_BUFFER_SAMPLES = BATCH_SAMPLES * 3;
+            
+            if (leftoverSamples > MAX_BUFFER_SAMPLES) {
+                console.warn(`%cBuffer too large (${(leftoverSamples/sampleRate).toFixed(2)}s) without silence! Forcing split.`, "color: red");
+                
+                const globalStart = bufferGlobalStart + lastSplitLocal;
+                const globalEnd = bufferGlobalStart + buffer.length;
+                
+                yield {
+                    index: globalIndex++,
+                    start: globalStart,
+                    end: globalEnd
+                };
+                
+                // Reset buffer completely
+                buffer = new Float32Array(0);
+                // The next buffer start will be exactly where we just ended (which is the current batchEnd)
+                bufferGlobalStart = batchEnd; 
+            } else {
+                // Normal carry over
+                console.log(`Carrying over ${(leftoverSamples/sampleRate).toFixed(2)}s to next batch.`);
+                buffer = buffer.slice(lastSplitLocal);
+                bufferGlobalStart = bufferGlobalStart + lastSplitLocal;
+            }
+        }
+        
+        console.groupEnd();
+        filePointer = batchEnd;
+        if (isLimitReached) break;
+    }
+    console.log(`%c[VAD] Completed. Total Chunks: ${globalIndex}`, "color: #4ade80; font-weight: bold;");
+}
+
+// Split Audio using Fixed Progressive Schedule (Generator Version)
+function* getFixedChunks(audioData: Float32Array, sampleRate: number, limitSec?: number): Generator<ChunkDefinition> {
+    // Progressive Chunking Strategy: 0s-20s, 20s-1m, 1m-3m, then 3m chunks
+    const CHUNK_SCHEDULE_ENDS = [20, 60, 180]; 
+    const STANDARD_CHUNK_DURATION = 180;
+
+    const totalSamples = audioData.length;
+    let currentSampleOffset = 0;
+    let scheduleIndex = 0;
+    let globalIndex = 0;
+
+    while (currentSampleOffset < totalSamples) {
+        // Limit Check for Test Mode
+        if (limitSec !== undefined && (currentSampleOffset / sampleRate) >= limitSec) {
+            break;
+        }
+
+        let chunkEndSamples;
+        
+        if (scheduleIndex < CHUNK_SCHEDULE_ENDS.length) {
+             const endSeconds = CHUNK_SCHEDULE_ENDS[scheduleIndex];
+             chunkEndSamples = Math.floor(endSeconds * sampleRate);
+             if (chunkEndSamples <= currentSampleOffset) {
+                 chunkEndSamples = currentSampleOffset + (STANDARD_CHUNK_DURATION * sampleRate);
+             }
+        } else {
+             chunkEndSamples = currentSampleOffset + (STANDARD_CHUNK_DURATION * sampleRate);
+        }
+        
+        chunkEndSamples = Math.min(chunkEndSamples, totalSamples);
+        if (chunkEndSamples <= currentSampleOffset) break;
+
+        yield {
+            index: globalIndex++,
+            start: currentSampleOffset,
+            end: chunkEndSamples
+        };
+        
+        currentSampleOffset = chunkEndSamples;
+        scheduleIndex++;
+    }
+}
+
+const getChunkDefinitions = (audioData: Float32Array, sampleRate: number, method: SegmentationMethod, vadSettings: VADSettings, limitSec?: number): Generator<ChunkDefinition> => {
+    if (method === 'vad') {
+        return getVADChunks(audioData, sampleRate, vadSettings.batchSize, vadSettings.minSilence, vadSettings.silenceThreshold, vadSettings.filteringEnabled, limitSec);
+    }
+    return getFixedChunks(audioData, sampleRate, limitSec);
+};
+
 
 // --- ONLINE MODE IMPLEMENTATION ---
 let aiInstance: GoogleGenAI | null = null;
@@ -375,87 +603,62 @@ const getAI = (apiKey?: string) => {
     return aiInstance || new GoogleGenAI({ apiKey: '' });
 };
 
-const generateSubtitlesOnline = async (file: File, apiKey: string | undefined, onProgress: (segments: SubtitleSegment[]) => void): Promise<SubtitleSegment[]> => {
-    // 1. Explicitly check for API Key
+const generateSubtitlesOnline = async (
+    file: File, 
+    apiKey: string | undefined, 
+    onProgress: (segments: SubtitleSegment[]) => void,
+    segmentationMethod: SegmentationMethod,
+    vadSettings: VADSettings,
+    testMode: boolean,
+    cachedAudioData?: Float32Array,
+    onStatus?: (status: string) => void
+): Promise<SubtitleSegment[]> => {
     if (!apiKey && (!process.env.API_KEY || process.env.API_KEY === '')) {
          throw new Error("API Key is missing. Please enter your Gemini API Key in Settings.");
     }
 
-    // 2. Get Raw Audio Data (Float32Array)
-    const audioData = await getAudioData(file, true) as Float32Array;
-    
-    const SAMPLE_RATE = 16000;
-    
-    // Progressive Chunking Strategy:
-    // 1. 0s - 20s (Fastest first paint)
-    // 2. 20s - 1m (Medium follow-up)
-    // 3. 1m - 3m (Longer context)
-    // 4. 3m+ (Standard large chunks of 3 minutes)
-    const CHUNK_SCHEDULE_ENDS = [20, 60, 180]; 
-    const STANDARD_CHUNK_DURATION = 180; // 3 minutes for subsequent chunks
-
-    const totalSamples = audioData.length;
-    
-    // Create chunk definitions
-    const chunkDefs = [];
-    let currentSampleOffset = 0;
-    let scheduleIndex = 0;
-
-    while (currentSampleOffset < totalSamples) {
-        let chunkEndSamples;
-        
-        if (scheduleIndex < CHUNK_SCHEDULE_ENDS.length) {
-             // Use scheduled absolute end time
-             const endSeconds = CHUNK_SCHEDULE_ENDS[scheduleIndex];
-             chunkEndSamples = Math.floor(endSeconds * SAMPLE_RATE);
-             // Ensure we don't go backwards or get stuck if audio started after schedule
-             if (chunkEndSamples <= currentSampleOffset) {
-                 chunkEndSamples = currentSampleOffset + (STANDARD_CHUNK_DURATION * SAMPLE_RATE);
-             }
-        } else {
-             // Standard duration
-             chunkEndSamples = currentSampleOffset + (STANDARD_CHUNK_DURATION * SAMPLE_RATE);
+    let audioData: Float32Array;
+    if (cachedAudioData) {
+        audioData = cachedAudioData;
+    } else {
+        if (onStatus) onStatus("Decoding Audio (Full File)...");
+        const data = await getAudioData(file, true);
+        if (typeof data === 'string') {
+             // Should not happen with getAudioData(..., true) but for type safety:
+             throw new Error("Received string data for VAD processing.");
         }
-        
-        // Clamp to total duration
-        chunkEndSamples = Math.min(chunkEndSamples, totalSamples);
-        
-        if (chunkEndSamples <= currentSampleOffset) break;
-
-        chunkDefs.push({
-            index: chunkDefs.length,
-            start: currentSampleOffset,
-            end: chunkEndSamples
-        });
-        
-        currentSampleOffset = chunkEndSamples;
-        scheduleIndex++;
+        audioData = data;
     }
 
-    // Storage for results (indexed by chunk index)
-    const resultsMap: Record<number, SubtitleSegment[]> = {};
+    if (onStatus) onStatus("Analyzing Audio Structure...");
+
+    const SAMPLE_RATE = 16000;
     
-    // Helper to update progress UI
+    // Determine limit
+    const limitSec = testMode ? vadSettings.batchSize : undefined;
+
+    // Get chunks generator
+    const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+
+    const resultsMap: Record<number, SubtitleSegment[]> = {};
+    let maxIndexFound = -1;
+    
     const updateProgress = () => {
         let allSegments: SubtitleSegment[] = [];
-        // Concat in order of chunks
-        for (let i = 0; i < chunkDefs.length; i++) {
+        // Since chunks come in order mostly, but we process in parallel, 
+        // we can iterate up to the max index we have processed so far.
+        for (let i = 0; i <= maxIndexFound; i++) {
             if (resultsMap[i]) {
                 allSegments = allSegments.concat(resultsMap[i]);
             }
         }
-        
         if (allSegments.length > 0) {
-            // Sort segments by start time
             allSegments.sort((a, b) => a.start - b.start);
-            // Update UI with re-indexed segments
             onProgress(allSegments.map((s, i) => ({ ...s, id: i })));
         }
     };
 
-    // Helper to process a single chunk
-    const processChunk = async (chunkDef: typeof chunkDefs[0]) => {
-        console.log(`[Gemini Subtitles] Processing Chunk ${chunkDef.index} (Start: ${chunkDef.start})...`);
+    const processChunk = async (chunkDef: ChunkDefinition) => {
         const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
         const base64Audio = await blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
@@ -463,30 +666,17 @@ const generateSubtitlesOnline = async (file: File, apiKey: string | undefined, o
         const actualDuration = chunkSamples.length / SAMPLE_RATE;
 
         const ai = getAI(apiKey);
-        const prompt = `Transcribe audio to subtitles in JSON.
-Array of objects: { "start": number (seconds), "end": number, "text": string }.
-Precision is key. Return start/end relative to the audio clip start (0.0).`;
+        
+        // Strict prompt to ensure no data loss
+        const prompt = `Transcribe the audio exactly. Output valid JSON array: [{ "start": float, "end": float, "text": string }]. 
+Timestamps must be relative to the start of this clip (0.0). 
+Include every spoken word. Do not summarize. Do not skip segments. Verbatim transcription only.`;
 
         let attempt = 0;
         const MAX_RETRIES = 3;
 
         while (attempt < MAX_RETRIES) {
             try {
-                // LOGGING REQUEST: Split 0-20s, 20s-1m, 1m-3m
-                let logPrefixReq = "";
-                if (timeOffset < 20) logPrefixReq = "[Gemini Request 0-20s]";
-                else if (timeOffset < 60) logPrefixReq = "[Gemini Request 20s-1m]";
-                else if (timeOffset < 180) logPrefixReq = "[Gemini Request 1m-3m]";
-
-                if (logPrefixReq) {
-                    console.log(`${logPrefixReq} Chunk ${chunkDef.index} starting at ${timeOffset}s Sending Payload:`, {
-                        model: 'gemini-2.5-flash',
-                        prompt: prompt,
-                        audioSizeBase64: base64Audio.length,
-                        config: { temperature: 0.0, responseMimeType: 'application/json' }
-                    });
-                }
-
                 const response = await ai.models.generateContent({
                     model: 'gemini-2.5-flash',
                     contents: [
@@ -515,26 +705,11 @@ Precision is key. Return start/end relative to the audio clip start (0.0).`;
                     }
                 });
 
-                // LOGGING RESPONSE: Split 0-20s, 20s-1m, 1m-3m
-                let logPrefixRes = "";
-                if (timeOffset < 20) logPrefixRes = "[Gemini Response 0-20s]";
-                else if (timeOffset < 60) logPrefixRes = "[Gemini Response 20s-1m]";
-                else if (timeOffset < 180) logPrefixRes = "[Gemini Response 1m-3m]";
-
-                if (logPrefixRes) {
-                     console.log(`${logPrefixRes} Chunk ${chunkDef.index} Response Length: ${response.text?.length || 0} Raw:`, response.text);
-                } else {
-                     console.log(`[Gemini Subtitles] Chunk ${chunkDef.index} Response Length: ${response.text?.length || 0}`);
-                }
-
                 if (response.text) {
                     const rawSegments = JSON.parse(response.text) as {start: number, end: number, text: string}[];
-                    
-                    // Fix potential timestamp scaling (ms vs s) using calculated method
                     const scale = detectTimeScale(rawSegments, actualDuration);
-                    
                     const processedSegments = rawSegments.map(s => ({
-                        id: 0, // Assigned later
+                        id: 0,
                         start: (parseTimestamp(s.start) * scale) + timeOffset,
                         end: (parseTimestamp(s.end) * scale) + timeOffset,
                         text: s.text.trim()
@@ -546,15 +721,7 @@ Precision is key. Return start/end relative to the audio clip start (0.0).`;
 
             } catch (e: any) {
                 attempt++;
-                console.warn(`[Gemini Subtitles] Chunk ${chunkDef.index} failed (Attempt ${attempt}/${MAX_RETRIES})`, e);
-                
-                // If it's the last attempt, log error and return empty
-                if (attempt >= MAX_RETRIES) {
-                     console.error(`[Gemini Subtitles] Chunk ${chunkDef.index} permanently failed after ${MAX_RETRIES} attempts.`);
-                     return [];
-                }
-                
-                // Exponential backoff: 1s, 2s, 4s
+                if (attempt >= MAX_RETRIES) return [];
                 const delay = Math.pow(2, attempt - 1) * 1000;
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
@@ -562,41 +729,35 @@ Precision is key. Return start/end relative to the audio clip start (0.0).`;
         return [];
     };
 
-    // Report initial status
+    if (onStatus) onStatus("Transcribing Segments...");
     onProgress([]);
 
-    // 3. Queue-based Concurrency (Faster "Time to First Byte" than Batching)
-    // We allow X concurrent requests. As soon as one finishes, we update UI and start next.
     const CONCURRENCY_LIMIT = 2;
-    let nextChunkIndex = 0;
-
+    
+    // Using a shared iterator for workers allows them to consume chunks as they are yielded by the generator
     const worker = async () => {
-        while (nextChunkIndex < chunkDefs.length) {
-            const currentIdx = nextChunkIndex++;
-            const def = chunkDefs[currentIdx];
+        while (true) {
+            const { value: chunkDef, done } = chunkGenerator.next();
+            if (done) break;
             
-            // Process
-            const segs = await processChunk(def);
+            // Track max index for UI rendering purposes
+            if (chunkDef.index > maxIndexFound) maxIndexFound = chunkDef.index;
             
-            // Store results
-            resultsMap[currentIdx] = segs;
-            
-            // IMMEDIATE UI UPDATE
+            const segs = await processChunk(chunkDef);
+            resultsMap[chunkDef.index] = segs;
             updateProgress();
         }
     };
 
-    // Start workers
     const workers = [];
-    for (let i = 0; i < Math.min(CONCURRENCY_LIMIT, chunkDefs.length); i++) {
+    for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
         workers.push(worker());
     }
-
     await Promise.all(workers);
 
-    // Final clean pass (ensure everything is consistent)
     let finalSegments: SubtitleSegment[] = [];
-    for (let i = 0; i < chunkDefs.length; i++) {
+    // Final pass to ensure everything is collected
+    for (let i = 0; i <= maxIndexFound; i++) {
         if (resultsMap[i]) finalSegments = finalSegments.concat(resultsMap[i]);
     }
     return finalSegments.map((s, i) => ({ ...s, id: i }));
@@ -607,7 +768,7 @@ export const getWordDefinition = async (word: string, context: string, isOffline
         if (localLLMConfig.enabled) {
             return await getLocalLLMDefinition(word, context, localLLMConfig);
         } else {
-             return await lookupWord(word, context); // Tiny local dictionary fallback
+             return await lookupWord(word, context); 
         }
     } else {
         return await getWordDefinitionOnline(word, context, apiKey);
@@ -615,11 +776,9 @@ export const getWordDefinition = async (word: string, context: string, isOffline
 };
 
 const getWordDefinitionOnline = async (word: string, context: string, apiKey?: string): Promise<WordDefinition> => {
-    // Explicitly check for API Key
     if (!apiKey && (!process.env.API_KEY || process.env.API_KEY === '')) {
          throw new Error("API Key is missing. Please enter your Gemini API Key in Settings.");
     }
-
     const response = await getAI(apiKey).models.generateContent({
         model: 'gemini-2.5-flash',
         contents: `Define the word "${word}" based on this context: "${context}".
@@ -639,9 +798,6 @@ const getWordDefinitionOnline = async (word: string, context: string, apiKey?: s
             }
         }
     });
-    
-    console.log(`[Gemini Definition] Raw response for "${word}":`, response.text);
-
     if (response.text) {
         return JSON.parse(response.text) as WordDefinition;
     }
@@ -662,14 +818,12 @@ export const fetchLocalModels = async (endpoint: string): Promise<string[]> => {
         const data = await response.json();
         return data.models.map((m: any) => m.name);
     } catch (e) {
-        console.error("Local LLM Fetch Error:", e);
         throw e;
     }
 };
 
 const getLocalLLMDefinition = async (word: string, context: string, config: LocalLLMConfig): Promise<WordDefinition> => {
     const baseUrl = config.endpoint.replace(/\/$/, '');
-    
     const prompt = `Define the word "${word}" based on this context: "${context}".
     Return a JSON object with exactly these keys:
     - word (string)
@@ -694,11 +848,9 @@ const getLocalLLMDefinition = async (word: string, context: string, config: Loca
         });
 
         const data = await response.json();
-        console.log("Local LLM (Ollama) Raw Response:", data);
         const text = data.response;
         return JSON.parse(text) as WordDefinition;
     } catch (e) {
-        console.error("Local LLM Generation Error:", e);
         throw new Error("Failed to get definition from Local LLM");
     }
 };
@@ -706,13 +858,9 @@ const getLocalLLMDefinition = async (word: string, context: string, config: Loca
 // --- LOCAL ASR (WHISPER) IMPLEMENTATION ---
 export const testLocalWhisperConnection = async (endpoint: string): Promise<boolean> => {
     try {
-        await fetch(endpoint, { 
-            method: 'OPTIONS', 
-            credentials: 'omit'
-        });
+        await fetch(endpoint, { method: 'OPTIONS', credentials: 'omit' });
         return true; 
     } catch (e: any) {
-        console.error("Local Whisper Connection Test Failed:", e);
         try {
              await fetch(endpoint, { method: 'GET', mode: 'no-cors' });
              return true; 
@@ -722,172 +870,88 @@ export const testLocalWhisperConnection = async (endpoint: string): Promise<bool
     }
 };
 
-// Generate subtitles using a local OpenAI-compatible Whisper server
 const generateSubtitlesLocalServer = async (
     audioData: Float32Array, 
     onProgress: (segments: SubtitleSegment[]) => void,
-    config: LocalASRConfig
+    config: LocalASRConfig,
+    segmentationMethod: SegmentationMethod,
+    vadSettings: VADSettings,
+    testMode: boolean
 ): Promise<SubtitleSegment[]> => {
-    // PROGRESSIVE CHUNKING: 0-20s, 20s-1m, 1m-3m, then 3m chunks
-    // To match user request for fast loading on "Big Model" (Local Whisper)
-    const CHUNK_SCHEDULE_ENDS = [20, 60, 180]; 
-    const STANDARD_CHUNK_DURATION = 180;
     const SAMPLE_RATE = 16000;
+    
+    // Determine limit (PRE-SPLITTING LIMIT)
+    const limitSec = testMode ? vadSettings.batchSize : undefined;
+
+    // Get chunks generator
+    const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
 
     let allSegments: SubtitleSegment[] = [];
-    let offsetSamples = 0;
-    let chunkIndex = 0;
-    let scheduleIndex = 0;
 
-    console.log(`[LocalASR] Starting transcription. Total samples: ${audioData.length}`);
-
-    while (offsetSamples < audioData.length) {
-        let chunkEndSamples;
-        
-        if (scheduleIndex < CHUNK_SCHEDULE_ENDS.length) {
-             const endSeconds = CHUNK_SCHEDULE_ENDS[scheduleIndex];
-             chunkEndSamples = Math.floor(endSeconds * SAMPLE_RATE);
-             if (chunkEndSamples <= offsetSamples) {
-                 chunkEndSamples = offsetSamples + (STANDARD_CHUNK_DURATION * SAMPLE_RATE);
-             }
-        } else {
-             chunkEndSamples = offsetSamples + (STANDARD_CHUNK_DURATION * SAMPLE_RATE);
-        }
-        
-        chunkEndSamples = Math.min(chunkEndSamples, audioData.length);
-        if (chunkEndSamples <= offsetSamples) break;
-
-        const chunkSamples = audioData.slice(offsetSamples, chunkEndSamples);
-        const chunkStartTime = offsetSamples / SAMPLE_RATE;
+    // Local server usually can't handle concurrency well on consumer GPU, so we do sequential
+    for (const chunkDef of chunkGenerator) {
+        const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
+        const chunkStartTime = chunkDef.start / SAMPLE_RATE;
         const chunkDuration = chunkSamples.length / SAMPLE_RATE;
 
-        // Encode chunk to WAV
         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
         const audioBlob = new Blob([wavBuffer], { type: 'audio/wav' });
         const file = new File([audioBlob], "chunk.wav", { type: "audio/wav" });
         
-        // Prepare FormData
         const formData = new FormData();
         formData.append('file', file);
         formData.append('model', config.model || 'whisper-1');
-        formData.append('response_format', 'verbose_json'); // Critical: Request segments
+        formData.append('response_format', 'verbose_json'); 
         
         try {
-            // LOGGING REQUEST: Split 0-20s, 20s-1m, 1m-3m
-            let logPrefixReq = "";
-            if (chunkStartTime < 20) logPrefixReq = "[LocalASR Request 0-20s]";
-            else if (chunkStartTime < 60) logPrefixReq = "[LocalASR Request 20s-1m]";
-            else if (chunkStartTime < 180) logPrefixReq = "[LocalASR Request 1m-3m]";
-
-            if (logPrefixReq) {
-                 console.log(`${logPrefixReq} Chunk ${chunkIndex} starting at ${formatTime(chunkStartTime)}s Sending Payload:`, {
-                     url: config.endpoint,
-                     model: config.model,
-                     response_format: 'verbose_json',
-                     fileSize: file.size
-                 });
-            } else {
-                 console.log(`[LocalASR] Sending Chunk ${chunkIndex} (${formatTime(chunkStartTime)}s)...`);
-            }
-            
             const response = await fetch(config.endpoint, {
                 method: 'POST',
                 body: formData
             });
 
-            if (!response.ok) {
-                const errText = await response.text();
-                console.warn(`[LocalASR] Chunk ${chunkIndex} failed (${response.status}): ${errText}`);
-                // We continue to next chunk to avoid failing entire video
-            } else {
+            if (response.ok) {
                 const data = await response.json();
-                
-                // LOGGING RESPONSE: Split 0-20s, 20s-1m, 1m-3m
-                let logPrefixRes = "";
-                if (chunkStartTime < 20) logPrefixRes = "[LocalASR Response 0-20s]";
-                else if (chunkStartTime < 60) logPrefixRes = "[LocalASR Response 20s-1m]";
-                else if (chunkStartTime < 180) logPrefixRes = "[LocalASR Response 1m-3m]";
-
-                if (logPrefixRes) {
-                     console.log(`${logPrefixRes} Chunk starting at ${chunkStartTime}s Raw Response:`, data);
-                } else {
-                     console.log(`[LocalASR] Chunk ${chunkIndex} Response received.`);
-                }
-
                 let rawSegments: any[] = [];
                 
                 if (data.segments && Array.isArray(data.segments)) {
                     rawSegments = data.segments;
                 } else if (Array.isArray(data)) {
-                    // Some servers return the array directly
                     rawSegments = data;
                 } else if (data.text) {
-                    // Fallback: If verbose_json ignored, we get full text.
                     rawSegments = [{ start: 0, end: chunkDuration, text: data.text }];
                 }
 
                 if (rawSegments.length > 0) {
-                    // --- Auto-Detect Timestamp Scale ---
-                    // Apply strict detection to local server outputs too
                     const scale = detectTimeScale(rawSegments, chunkDuration);
-
                     const chunkSegments: SubtitleSegment[] = rawSegments.map((s: any) => {
                          const startRaw = parseTimestamp(s.start);
                          const endRaw = parseTimestamp(s.end);
-                         
-                         const startRel = startRaw * scale;
-                         const endRel = endRaw * scale;
-
-                         // Timestamps are assumed relative to the chunk start
                          return {
                              id: 0,
-                             start: startRel + chunkStartTime,
-                             end: endRel + chunkStartTime,
+                             start: (startRaw * scale) + chunkStartTime,
+                             end: (endRaw * scale) + chunkStartTime,
                              text: s.text?.trim() || ""
                          };
                     }).filter(s => s.text.length > 0);
 
-                    // --- Deduplication & Merging ---
+                    // Merge logic
                     for (const seg of chunkSegments) {
                         const last = allSegments[allSegments.length - 1];
                         if (last) {
-                            // 1. Exact Repetition Filter
                             if (seg.text === last.text) continue;
-                            
-                            // 2. Substring Repetition Filter (common hallucination)
-                            // Clean text to compare content
                             const cleanSeg = seg.text.toLowerCase().trim();
                             const cleanLast = last.text.toLowerCase().trim();
-                            
-                            // If current is short and contained in last, skip
                             if (cleanSeg.length > 3 && cleanLast.endsWith(cleanSeg)) continue;
-
-                            // 3. Fix Overlap
-                            if (seg.start < last.end) {
-                                // If overlap is small, adjust start
-                                if (last.end - seg.start < 1.0) {
-                                    seg.start = last.end;
-                                }
+                            if (seg.start < last.end && last.end - seg.start < 1.0) {
+                                seg.start = last.end;
                             }
                         }
-                        
-                        if (seg.end > seg.start) {
-                            allSegments.push(seg);
-                        }
+                        if (seg.end > seg.start) allSegments.push(seg);
                     }
-
-                    // Update UI incrementally
                     onProgress(allSegments.map((s, i) => ({...s, id: i})));
                 }
             }
-
-        } catch (e) {
-            console.error(`[LocalASR] Chunk ${chunkIndex} error:`, e);
-        }
-
-        offsetSamples = chunkEndSamples;
-        scheduleIndex++;
-        chunkIndex++;
+        } catch (e) {}
     }
 
     return allSegments.map((s, i) => ({ ...s, id: i }));
@@ -907,51 +971,89 @@ export const generateSubtitles = async (
     isOffline: boolean,
     modelId: string,
     apiKey: string,
-    localASRConfig: LocalASRConfig
+    localASRConfig: LocalASRConfig,
+    segmentationMethod: SegmentationMethod,
+    vadSettings: VADSettings,
+    testMode: boolean = false,
+    cachedAudioData?: Float32Array,
+    onStatus?: (status: string) => void
 ): Promise<SubtitleSegment[]> => {
 
-    // 1. Online Mode
     if (!isOffline) {
-        return await generateSubtitlesOnline(videoFile, apiKey, onProgress);
+        return await generateSubtitlesOnline(videoFile, apiKey, onProgress, segmentationMethod, vadSettings, testMode, cachedAudioData, onStatus);
     }
 
-    // Decode Audio for Offline use
-    // We do this once here to share between Local Server and Browser Worker logic
-    const audioData = await getAudioData(videoFile, true) as Float32Array;
+    let audioData: Float32Array;
+    if (cachedAudioData) {
+        audioData = cachedAudioData;
+    } else {
+        if (onStatus) onStatus("Decoding Audio (Full File)...");
+        const data = await getAudioData(videoFile, true);
+        if (typeof data === 'string') throw new Error("Received string data for offline processing.");
+        audioData = data;
+    }
 
-    // 2. Offline - Local Whisper Server
+    if (onStatus) onStatus("Analyzing Audio Structure...");
+
+    const SAMPLE_RATE = 16000;
+
     if (localASRConfig.enabled) {
-        return await generateSubtitlesLocalServer(audioData, onProgress, localASRConfig);
+        return await generateSubtitlesLocalServer(audioData, onProgress, localASRConfig, segmentationMethod, vadSettings, testMode);
     }
 
-    // 3. Offline - In-Browser Worker
-    return new Promise((resolve, reject) => {
+    // In-Browser Worker
+    // Note: To support VAD here, we must stream chunks to the worker sequentially.
+    return new Promise(async (resolve, reject) => {
         const w = initWorker();
         onSubtitleProgressCallback = onProgress;
         
         accumulatedSegments = [];
         activeJobId++;
         const jobId = activeJobId;
+        
+        // Determine limit
+        const limitSec = testMode ? vadSettings.batchSize : undefined;
 
-        // Listen for completion
-        const completionHandler = (e: MessageEvent) => {
-            if (e.data.jobId === jobId) {
-                if (e.data.type === 'complete') {
-                    w.removeEventListener('message', completionHandler);
-                    resolve(accumulatedSegments);
-                }
-                if (e.data.type === 'error') {
-                    w.removeEventListener('message', completionHandler);
-                    reject(new Error(e.data.data));
-                }
+        // Setup chunk generator
+        const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+
+        // We'll process chunks sequentially to avoid overloading the worker memory/queue
+        try {
+            if (onStatus) onStatus("Running AI Model...");
+            for (const chunkDef of chunkGenerator) {
+                // Check if job cancelled (simple check: if activeJobId changed)
+                if (jobId !== activeJobId) break;
+
+                const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
+                const timeOffset = chunkDef.start / SAMPLE_RATE;
+
+                // Create a promise for this specific chunk
+                await new Promise<void>((chunkResolve, chunkReject) => {
+                    const chunkHandler = (e: MessageEvent) => {
+                        if (e.data.jobId === jobId) {
+                            if (e.data.type === 'complete') {
+                                w.removeEventListener('message', chunkHandler);
+                                chunkResolve();
+                            }
+                            if (e.data.type === 'error') {
+                                w.removeEventListener('message', chunkHandler);
+                                chunkReject(new Error(e.data.data));
+                            }
+                            // 'partial' events are handled by the global initWorker onmessage
+                        }
+                    };
+                    w.addEventListener('message', chunkHandler);
+                    
+                    w.postMessage({
+                        type: 'generate',
+                        data: { audio: chunkSamples, model: modelId, jobId, timeOffset }
+                    });
+                });
             }
-        };
-        w.addEventListener('message', completionHandler);
-
-        w.postMessage({
-            type: 'generate',
-            data: { audio: audioData, model: modelId, jobId }
-        });
+            resolve(accumulatedSegments);
+        } catch (e) {
+            reject(e);
+        }
     });
 };
 

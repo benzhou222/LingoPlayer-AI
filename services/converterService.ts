@@ -26,15 +26,6 @@ async function importFFmpeg() {
         return URL.createObjectURL(blob);
     };
 
-    console.log("Loading FFmpeg modules...");
-
-    // 1. Load errors.js (Dependency of utils)
-    // 2. Load utils.js (Dependency of worker & classes)
-    // 3. Load const.js (Dependency of worker & classes)
-    // 4. Load worker.js (Dependency of classes)
-    // 5. Load classes.js (Dependency of index)
-    // 6. Load index.js (Entry point)
-
     try {
         // --- 1. errors.js ---
         const errorsCode = await fetchText(`${baseURL}/errors.js`);
@@ -82,15 +73,6 @@ async function importFFmpeg() {
             `from '${errorsBlobUrl}'`
         );
         
-        // IMPORTANT: Patch the Worker creation to use the full CDN URL for the actual worker script
-        // The library tries to load "worker.js" relative to itself.
-        // We need to force it to use a Blob URL or the full CDN path if CORS allows.
-        // For 0.12.x, we usually pass coreURL and wasmURL to load(), but the worker wrapper itself 
-        // is created inside classes.js.
-        // The best way for the worker wrapper is to let it be, but ensuring it doesn't cross-origin fail.
-        
-        // Actually, best practice for 0.12.x in strict env is to rely on the class structure 
-        // but ensuring the imports inside classes.js resolve. 
         const classesBlobUrl = createBlobURL(classesCode);
 
         // --- 6. index.js ---
@@ -110,15 +92,9 @@ async function importFFmpeg() {
         
         ffmpeg = new FFmpeg();
         
-        // Logging
-        ffmpeg.on('log', ({ message }: { message: string }) => {
-            console.log('[FFmpeg Log]:', message);
-        });
-
         return ffmpeg;
 
     } catch (e) {
-        console.error("FFmpeg Manual Load Failed:", e);
         throw e;
     }
 }
@@ -135,7 +111,6 @@ async function loadFFmpeg(onProgress?: (progress: number) => void) {
             ? 'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm'
             : 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
         
-        console.log(`Loading FFmpeg Core (${isMultiThreaded ? 'Multi-threaded' : 'Single-threaded'})...`);
         if (onProgress) onProgress(5);
 
         await ffmpegInstance.load({
@@ -147,7 +122,6 @@ async function loadFFmpeg(onProgress?: (progress: number) => void) {
         });
         
         if (onProgress) onProgress(10);
-        console.log("FFmpeg Core Loaded.");
     }
     return ffmpegInstance;
 }
@@ -184,7 +158,6 @@ export async function extractAudioAsWav(videoFile: File): Promise<Float32Array> 
         const cmd = ['-i', inputName, '-ar', '16000', '-ac', '1', '-map', '0:a:0', outputName];
         if (threads > 1) cmd.unshift('-threads', threads.toString());
 
-        console.log("Running FFmpeg extraction:", cmd.join(' '));
         const ret = await instance.exec(cmd);
         
         if (ret !== 0) {
@@ -203,7 +176,6 @@ export async function extractAudioAsWav(videoFile: File): Promise<Float32Array> 
         return audioBuffer.getChannelData(0);
 
     } catch (e) {
-        console.error("FFmpeg Audio Extraction Failed:", e);
         throw e;
     }
 }

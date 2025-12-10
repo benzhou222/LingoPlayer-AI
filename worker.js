@@ -11,11 +11,9 @@ class PipelineFactory {
 
     static async getInstance(progress_callback = null) {
         if (this.instance === null) {
-            console.log("Loading Whisper model...");
             this.instance = await pipeline(this.task, this.model, {
                 progress_callback
             });
-            console.log("Whisper model loaded.");
         }
         return this.instance;
     }
