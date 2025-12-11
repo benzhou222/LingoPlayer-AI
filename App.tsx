@@ -1,14 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink } from 'lucide-react';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink, Square } from 'lucide-react';
 import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from './types';
-import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData } from './services/geminiService';
+import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData, cancelSubtitleGeneration } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
 import { WordDefinitionPanel } from './components/WordDefinitionPanel';
 import { extractAudioAsWav } from './services/converterService';
 
 const OFFLINE_MODELS = [
-    { id: 'Xenova/whisper-tiny', name: 'Tiny (Multilingual, ~40MB)' },
-    { id: 'Xenova/whisper-tiny.en', name: 'Tiny English (Fastest, ~40MB)' },
     { id: 'Xenova/whisper-base', name: 'Base (Multilingual, ~75MB)' },
     { id: 'Xenova/whisper-base.en', name: 'Base English (Balanced, ~75MB)' },
     { id: 'Xenova/whisper-small', name: 'Small (Multilingual, ~250MB)' },
@@ -52,8 +50,7 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [loadingWord, setLoadingWord] = useState(false);
   const [selectedWord, setSelectedWord] = useState<WordDefinition | null>(null);
-  const [showVocabSidebar, setShowVocabSidebar] = useState(true);
-  const [showModelAlert, setShowModelAlert] = useState(false); // Alert modal state
+  const [showVocabSidebar, setShowVocabSidebar] = useState(false);
   
   // Layout Resizing State
   const [leftPanelWidth, setLeftPanelWidth] = useState(320);
@@ -306,11 +303,7 @@ export default function App() {
 
   // --- Click Interceptor for Load Video ---
   const handleLoadVideoClick = (e: React.MouseEvent) => {
-    // If in Offline Mode AND model is NOT ready AND Local Whisper is NOT enabled
-    if (isOffline && modelStatus !== 'ready' && !localASRConfig.enabled) {
-      e.preventDefault(); // Stop file picker from opening
-      setShowModelAlert(true); // Show custom modal
-    }
+     // No blocking here, user can load video anytime
   };
 
   // --- File Handling ---
@@ -335,12 +328,23 @@ export default function App() {
     const url = URL.createObjectURL(file);
     setVideoSrc(url);
     
-    // Update file state - this will trigger the useEffect to reset
+    // Update file state
     setVideoFile(file);
   };
 
   // Handle Manual Generation
   const handleGenerate = async (testMode: boolean = false) => {
+    // START CHANGE: Stop Logic
+    if (isProcessing) {
+        cancelSubtitleGeneration();
+        setIsProcessing(false);
+        setProcessingStatus('Stopped.');
+        // Invalidate current running job callbacks
+        processingIdRef.current += 1;
+        return;
+    }
+    // END CHANGE
+
     if (!videoFile) return;
 
     const currentId = processingIdRef.current + 1;
@@ -571,27 +575,6 @@ export default function App() {
   return (
     <div className="flex h-screen bg-black text-gray-100 font-sans overflow-hidden">
       
-      {/* MODEL REQUIREMENT ALERT MODAL */}
-      {showModelAlert && (
-        <div className="fixed inset-0 z-[110] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
-            <div className="bg-gray-900 border border-yellow-700/50 rounded-xl shadow-2xl w-full max-w-sm p-6 text-center relative animate-in zoom-in-95 duration-200">
-                <div className="mx-auto w-12 h-12 bg-yellow-900/30 rounded-full flex items-center justify-center mb-4">
-                    <AlertTriangle className="text-yellow-500" size={24} />
-                </div>
-                <h3 className="text-xl font-bold text-white mb-2">Offline Model Required</h3>
-                <p className="text-gray-400 mb-6 text-sm leading-relaxed">
-                   Please download the Whisper model from the settings or enable Local Whisper Server before loading a video.
-                </p>
-                <button 
-                    onClick={() => { setShowModelAlert(false); setIsSettingsOpen(true); }}
-                    className="w-full py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white font-medium rounded-lg transition-colors"
-                >
-                    Open Settings
-                </button>
-            </div>
-        </div>
-      )}
-
       {/* SETTINGS MODAL */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
@@ -1036,11 +1019,15 @@ export default function App() {
             <div className="flex items-center gap-2">
                 <button 
                     onClick={() => handleGenerate(false)}
-                    disabled={isProcessing || !videoFile}
-                    className="flex-1 flex items-center justify-center gap-2 py-2 px-3 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-500 text-white text-xs font-bold rounded transition-colors shadow-lg shadow-blue-900/20"
+                    disabled={!videoFile}
+                    className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 text-xs font-bold rounded transition-colors shadow-lg shadow-blue-900/20 ${
+                        isProcessing 
+                        ? 'bg-red-600 hover:bg-red-500 text-white' 
+                        : 'bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-500 text-white'
+                    }`}
                 >
-                    {isProcessing ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
-                    <span>Generate</span>
+                    {isProcessing ? <Square size={14} fill="currentColor" /> : <PlayCircle size={14} />}
+                    <span>{isProcessing ? 'Stop' : 'Generate'}</span>
                 </button>
                 <button 
                     onClick={() => handleGenerate(true)}
@@ -1184,13 +1171,17 @@ export default function App() {
                 playsInline
               />
             ) : (
-              <div className="text-gray-600 flex flex-col items-center">
-                <Upload size={48} className="mb-4 opacity-50" />
-                <p>Please load a local video file.</p>
-                <p className="text-xs text-gray-500 mt-2">
-                   {isOffline ? "Ready for Offline Mode" : "Ready for Online Mode"}
-                </p>
-              </div>
+              <label 
+                  onClick={handleLoadVideoClick}
+                  className="text-gray-600 flex flex-col items-center cursor-pointer hover:text-gray-400 transition-colors"
+              >
+                  <Upload size={48} className="mb-4 opacity-50" />
+                  <p className="font-medium text-lg">Click to Load Video</p>
+                  <p className="text-xs text-gray-500 mt-2">
+                     {isOffline ? "Ready for Offline Mode" : "Ready for Online Mode"}
+                  </p>
+                  <input type="file" accept=".mp4" onChange={handleFileChange} className="hidden" />
+              </label>
             )}
           </div>
 

@@ -105,6 +105,10 @@ let onLoadProgressCallback: ((data: any) => void) | null = null;
 let accumulatedSegments: SubtitleSegment[] = [];
 let activeJobId = 0; // Track the current generation job
 
+export const cancelSubtitleGeneration = () => {
+    activeJobId++;
+};
+
 const initWorker = () => {
   if (!worker) {
     const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
@@ -127,25 +131,66 @@ const initWorker = () => {
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'ready' });
       } 
       else if (type === 'partial') {
-        // Append new chunks to our local accumulator
-        const newSegments: SubtitleSegment[] = (data || []).map((chunk: any) => ({
-           id: accumulatedSegments.length, // temporary ID
+        // Append new chunks to our local accumulator with filtering
+        const rawSegments = (data || []).map((chunk: any) => ({
+           id: 0, 
            start: chunk.timestamp[0],
            end: chunk.timestamp[1],
            text: chunk.text.trim()
         }));
-        
-        // Filter out empty or extremely short hallucinations
-        const validSegments = newSegments.filter((s: SubtitleSegment) => s.text.length > 1);
-        
-        if (validSegments.length > 0) {
-            accumulatedSegments = [...accumulatedSegments, ...validSegments];
-            // Sort to prevent out of order display during streaming
-            accumulatedSegments.sort((a, b) => a.start - b.start);
-            // Re-assign IDs
-            accumulatedSegments = accumulatedSegments.map((s, i) => ({ ...s, id: i }));
-            if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
+
+        // 1. Filter out known hallucinations and bad segments
+        const validSegments = rawSegments.filter((s: SubtitleSegment) => {
+             if (!s.text) return false;
+             
+             const t = s.text.toLowerCase().trim();
+             // Whisper hallucinations
+             if (t === 'you' || t === 'thank you' || t === 'thanks for watching' || t.includes('subtitle by') || t === '.') return false;
+             
+             // Tiny duration with long text is suspicious
+             if ((s.end - s.start) < 0.1 && t.length > 5) return false;
+             
+             return true;
+        });
+
+        // 2. Deduplicate and Merge
+        for (const seg of validSegments) {
+             const last = accumulatedSegments[accumulatedSegments.length - 1];
+             if (last) {
+                  // Exact text match -> skip
+                  if (seg.text === last.text) continue;
+
+                  // Normalize for fuzzy match
+                  const cleanSeg = seg.text.toLowerCase().replace(/[.,?!]/g, '').trim();
+                  const cleanLast = last.text.toLowerCase().replace(/[.,?!]/g, '').trim();
+
+                  // Partial overlap at the end (e.g., "Hello world" -> "world")
+                  if (cleanSeg.length > 2 && cleanLast.endsWith(cleanSeg)) continue;
+                  
+                  // Timestamp overlap adjustment
+                  if (seg.start < last.end) {
+                      // If overlap is small, adjust start
+                      if (last.end - seg.start < 0.5) {
+                          seg.start = last.end;
+                      } 
+                      // If overlap is large or contained, check content length
+                      else if (seg.end <= last.end) {
+                          // Contained segment with different text? Skip to be safe
+                          continue;
+                      }
+                  }
+             }
+
+             if (seg.end > seg.start) {
+                 accumulatedSegments.push(seg);
+             }
         }
+        
+        // Re-assign IDs and sort
+        accumulatedSegments.sort((a, b) => a.start - b.start);
+        accumulatedSegments = accumulatedSegments.map((s, i) => ({ ...s, id: i }));
+
+        if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
       }
       else if (type === 'complete') {
         if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
@@ -209,7 +254,7 @@ export const getAudioData = async (videoFile: File, forOffline: boolean): Promis
             }
         }
     } catch (e: any) {
-        throw new Error(e.message || "Unable to decode audio data. The file format might be corrupted or unsupported.");
+        throw e;
     }
 };
 
@@ -663,7 +708,8 @@ const generateSubtitlesOnline = async (
     vadSettings: VADSettings,
     testMode: boolean,
     cachedAudioData?: Float32Array,
-    onStatus?: (status: string) => void
+    onStatus?: (status: string) => void,
+    jobId?: number
 ): Promise<SubtitleSegment[]> => {
     if (!apiKey && (!process.env.API_KEY || process.env.API_KEY === '')) {
          throw new Error("API Key is missing. Please enter your Gemini API Key in Settings.");
@@ -802,9 +848,13 @@ Include every spoken word. Do not summarize. Do not skip segments. Verbatim tran
     // Using a shared iterator for workers allows them to consume chunks as they are yielded by the generator
     const worker = async () => {
         while (true) {
+            if (jobId !== undefined && jobId !== activeJobId) break; // Cancellation check
+
             const { value: chunkDef, done } = chunkGenerator.next();
             if (done) break;
             
+            if (jobId !== undefined && jobId !== activeJobId) break; // Double check
+
             // Track max index for UI rendering purposes
             if (chunkDef.index > maxIndexFound) maxIndexFound = chunkDef.index;
             
@@ -946,7 +996,8 @@ const generateSubtitlesLocalServer = async (
     config: LocalASRConfig,
     segmentationMethod: SegmentationMethod,
     vadSettings: VADSettings,
-    testMode: boolean
+    testMode: boolean,
+    jobId?: number
 ): Promise<SubtitleSegment[]> => {
     const SAMPLE_RATE = 16000;
     
@@ -963,6 +1014,8 @@ const generateSubtitlesLocalServer = async (
 
     // Local server usually can't handle concurrency well on consumer GPU, so we do sequential
     for (const chunkDef of chunkGenerator) {
+        if (jobId !== undefined && jobId !== activeJobId) break; // Cancellation check
+
         const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
         const chunkStartTime = chunkDef.start / SAMPLE_RATE;
         const chunkDuration = chunkSamples.length / SAMPLE_RATE;
@@ -1065,9 +1118,16 @@ export const generateSubtitles = async (
     cachedAudioData?: Float32Array,
     onStatus?: (status: string) => void
 ): Promise<SubtitleSegment[]> => {
+    
+    // Start new job
+    activeJobId++;
+    const jobId = activeJobId;
+    
+    // Clear accumulation for new run (legacy global var, but used by worker callbacks)
+    accumulatedSegments = []; 
 
     if (!isOffline) {
-        return await generateSubtitlesOnline(videoFile, apiKey, onProgress, segmentationMethod, vadSettings, testMode, cachedAudioData, onStatus);
+        return await generateSubtitlesOnline(videoFile, apiKey, onProgress, segmentationMethod, vadSettings, testMode, cachedAudioData, onStatus, jobId);
     }
 
     let audioData: Float32Array;
@@ -1085,7 +1145,7 @@ export const generateSubtitles = async (
     const SAMPLE_RATE = 16000;
 
     if (localASRConfig.enabled) {
-        return await generateSubtitlesLocalServer(audioData, onProgress, localASRConfig, segmentationMethod, vadSettings, testMode);
+        return await generateSubtitlesLocalServer(audioData, onProgress, localASRConfig, segmentationMethod, vadSettings, testMode, jobId);
     }
 
     // In-Browser Worker
@@ -1093,12 +1153,6 @@ export const generateSubtitles = async (
     return new Promise(async (resolve, reject) => {
         const w = initWorker();
         onSubtitleProgressCallback = onProgress;
-        
-        // --- CRITICAL RESET: Ensure we start with a clean slate for this new job ---
-        accumulatedSegments = [];
-        activeJobId++; 
-        const jobId = activeJobId;
-        console.log(`[Offline Job] Starting new generation (Job ID: ${jobId}). Cleared previous results.`);
         
         // Determine limit
         const limitSec = testMode ? vadSettings.batchSize : undefined;
