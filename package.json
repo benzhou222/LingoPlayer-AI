@@ -13,6 +13,7 @@
     "lucide-react": "0.292.0",
     "@google/genai": "latest",
     "@ffmpeg/util": "0.12.1",
+    "jszip": "3.10.1",
     "react-dom": "^19.2.1"
   },
   "devDependencies": {

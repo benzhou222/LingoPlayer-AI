@@ -47,7 +47,7 @@ export const VideoControls: React.FC<VideoControlsProps> = ({
   volume,
   onVolumeChange,
   isMuted,
-  onToggleMute
+  onToggleMute,
 }) => {
   const rates = [0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.25, 1.5, 2.0];
 

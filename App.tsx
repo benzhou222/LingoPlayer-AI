@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical } from 'lucide-react';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink } from 'lucide-react';
 import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from './types';
 import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
@@ -21,7 +21,8 @@ const OFFLINE_MODELS = [
 const formatTime = (seconds: number) => {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  const ms = Math.floor((seconds * 1000) % 1000);
+  return `${m}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
 };
 
 export default function App() {
@@ -53,7 +54,7 @@ export default function App() {
   const [selectedWord, setSelectedWord] = useState<WordDefinition | null>(null);
   const [showVocabSidebar, setShowVocabSidebar] = useState(true);
   const [showModelAlert, setShowModelAlert] = useState(false); // Alert modal state
-
+  
   // Layout Resizing State
   const [leftPanelWidth, setLeftPanelWidth] = useState(320);
   const [rightPanelWidth, setRightPanelWidth] = useState(320);
@@ -80,11 +81,11 @@ export default function App() {
   const [vadSettings, setVadSettings] = useState<VADSettings>(() => {
     try {
         const saved = localStorage.getItem('lingo_vad_settings');
-        // Updated defaults: minSilence 0.4, silenceThreshold 0.03, filteringEnabled: true
-        const defaultSettings = { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.03, filteringEnabled: true };
+        // Updated defaults: minSilence 0.4, silenceThreshold 0.02, filteringEnabled: true
+        const defaultSettings = { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.02, filteringEnabled: true };
         return saved ? { ...defaultSettings, ...JSON.parse(saved) } : defaultSettings;
     } catch {
-        return { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.03, filteringEnabled: true };
+        return { batchSize: 120, minSilence: 0.4, silenceThreshold: 0.02, filteringEnabled: true };
     }
   });
 
@@ -323,6 +324,10 @@ export default function App() {
     setIsPlaying(false);
     setErrorMsg(null); // Clear previous errors
     
+    // Clear subtitles when loading new file
+    setSubtitles([]);
+    setCurrentSegmentIndex(-1);
+    
     // Clear Audio Cache on new file
     audioDataCacheRef.current = null;
     
@@ -334,25 +339,15 @@ export default function App() {
     setVideoFile(file);
   };
 
-  // EFFECT: RESET ON NEW VIDEO (No Auto Generate)
-  useEffect(() => {
-    if (videoFile) {
-        setSubtitles([]);
-        setCurrentSegmentIndex(-1);
-        setSelectedWord(null);
-        setErrorMsg(null);
-        setIsProcessing(false);
-        setProcessingStatus(''); // Clear status
-        setIsPlaying(false);
-    }
-  }, [videoFile]);
-
   // Handle Manual Generation
   const handleGenerate = async (testMode: boolean = false) => {
     if (!videoFile) return;
 
     const currentId = processingIdRef.current + 1;
     processingIdRef.current = currentId;
+
+    console.log("%c[Generator] Starting new generation run.", "color: #a78bfa; font-weight: bold;");
+    console.log("[Generator] Current VAD Settings:", vadSettings);
 
     // Reset UI for processing state
     setSubtitles([]);
@@ -382,6 +377,8 @@ export default function App() {
                  audioDataForProcess = decoded;
                  audioDataCacheRef.current = decoded;
              }
+        } else {
+             console.log("[Generator] Using cached Raw Audio Data (decoding skipped). VAD will re-run on this data.");
         }
 
         await generateSubtitles(
@@ -422,7 +419,6 @@ export default function App() {
         }
     }
   };
-
 
   // --- Video Logic ---
   const handleLoadedMetadata = () => {
@@ -1134,6 +1130,7 @@ export default function App() {
             <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">LingoPlayer AI</h1>
           </div>
           <div className="flex items-center gap-3">
+            
             <label 
                 onClick={handleLoadVideoClick}
                 className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm font-medium rounded-lg cursor-pointer transition-colors border border-gray-700"
@@ -1181,7 +1178,7 @@ export default function App() {
                 onLoadedMetadata={handleLoadedMetadata}
                 onEnded={() => setIsPlaying(false)}
                 onError={(e) => {
-                    // Only show generic error if we don't have a more specific one from service already
+                    // Only show generic error if we don't have an more specific one from service already
                     if (!errorMsg) setErrorMsg("Browser cannot decode this video's audio. The format might be unsupported.");
                 }}
                 playsInline
@@ -1254,6 +1251,7 @@ export default function App() {
                 onAddToVocab={addToVocab}
                 isSaved={selectedWord ? vocabulary.some(v => v.word === selectedWord.word) : false}
                 isLoading={loadingWord}
+                onWordSearch={handleWordClick}
              />
           </div>
 

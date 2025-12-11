@@ -2,6 +2,7 @@ import { SubtitleSegment, WordDefinition, LocalLLMConfig, LocalASRConfig, Segmen
 import { GoogleGenAI, Type } from "@google/genai";
 import { extractAudioAsWav } from "./converterService";
 import { lookupWord, speakText } from "../utils/dictionary";
+import JSZip from "jszip";
 
 // --- OFFLINE WORKER CODE ---
 const WORKER_CODE = `
@@ -161,24 +162,49 @@ const initWorker = () => {
 // --- AUDIO UTILITIES ---
 export const getAudioData = async (videoFile: File, forOffline: boolean): Promise<Float32Array | string> => {
     try {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        const targetSampleRate = 16000;
+        // Use AudioContext to decode. It automatically handles container formats (mp4, webm, etc) supported by browser.
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: targetSampleRate });
         const arrayBuffer = await videoFile.arrayBuffer();
         
-        try {
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-            if (forOffline) {
-                return audioBuffer.getChannelData(0);
+        // Internal helper to process buffer
+        const processDecodedBuffer = async (decoded: AudioBuffer) => {
+            let monoData: Float32Array;
+
+            // Perform robust downmixing if multiple channels exist
+            if (decoded.numberOfChannels > 1) {
+                // Use OfflineAudioContext for fast and correct native downmixing
+                const offlineCtx = new OfflineAudioContext(1, decoded.length, targetSampleRate);
+                const source = offlineCtx.createBufferSource();
+                source.buffer = decoded;
+                source.connect(offlineCtx.destination);
+                source.start();
+                const renderedBuffer = await offlineCtx.startRendering();
+                monoData = renderedBuffer.getChannelData(0);
             } else {
-                const pcmData = audioBuffer.getChannelData(0);
-                const wavBuffer = encodeWAV(pcmData, 16000);
+                monoData = decoded.getChannelData(0);
+            }
+
+            if (forOffline) {
+                return monoData;
+            } else {
+                const wavBuffer = encodeWAV(monoData, targetSampleRate);
                 return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
             }
+        };
+
+        try {
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            return await processDecodedBuffer(audioBuffer);
         } catch (decodeError) {
+            // Fallback to FFmpeg if browser decode fails (e.g. MKV AC3)
+            console.warn("Browser decode failed, trying FFmpeg fallback...", decodeError);
             const pcmData = await extractAudioAsWav(videoFile);
+            
             if (forOffline) {
                 return pcmData;
             } else {
-                const wavBuffer = encodeWAV(pcmData, 16000);
+                const wavBuffer = encodeWAV(pcmData, targetSampleRate);
                 return blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
             }
         }
@@ -226,6 +252,31 @@ function blobToBase64(blob: Blob): Promise<string> {
         reader.onerror = reject;
         reader.readAsDataURL(blob);
     });
+}
+
+// Helper: Save Zip
+async function saveDebugZip(zip: JSZip) {
+    try {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const filename = `lingoplayer_vad_debug_${timestamp}.zip`;
+
+        console.log("[Debug] Generating ZIP file...");
+        const blob = await zip.generateAsync({type: "blob"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        
+        console.log(`%c[Debug] VAD Processed Audio Saved!`, "color: #10b981; font-weight: bold; font-size: 14px;");
+        console.log(`%cFilename: ${filename}`, "color: #34d399;");
+        console.log(`%cLocation: Browser Downloads Folder (Exact path hidden by browser security)`, "color: #34d399;");
+    } catch (e) {
+        console.error("Failed to generate/save debug zip", e);
+    }
 }
 
 // Helper to safely parse potentially weird timestamp formats (for local/legacy parsing)
@@ -315,17 +366,17 @@ const calculateRMS = (buffer: Float32Array): number => {
 };
 
 // 2. Band-Pass Filter (Isolate Vocals)
-// 80Hz HPF + 3000Hz LPF
+// 60Hz HPF + 6000Hz LPF (Widened to prevent cutting speech)
 const applyVocalFilter = (audio: Float32Array, sampleRate: number): Float32Array => {
     const filtered = new Float32Array(audio.length);
     const dt = 1 / sampleRate;
     
-    // High Pass (80Hz) - Remove rumble
-    const rc_hp = 1 / (2 * Math.PI * 80);
+    // High Pass (60Hz) - Remove deep rumble
+    const rc_hp = 1 / (2 * Math.PI * 60);
     const alpha_hp = rc_hp / (rc_hp + dt);
     
-    // Low Pass (3000Hz) - Remove hiss
-    const rc_lp = 1 / (2 * Math.PI * 3000);
+    // Low Pass (6000Hz) - Remove high hiss but keep fricatives
+    const rc_lp = 1 / (2 * Math.PI * 6000);
     const alpha_lp = dt / (rc_lp + dt);
 
     let lastIn = 0;
@@ -404,7 +455,7 @@ function* getVADChunks(
     filteringEnabled: boolean, 
     limitSec?: number
 ): Generator<ChunkDefinition> {
-    console.log(`%c[VAD] Starting VAD Process. Total Duration: ${(audioData.length / sampleRate).toFixed(2)}s`, "color: #4ade80; font-weight: bold;");
+    console.log(`%c[VAD] Fresh Start - Clearing state and re-scanning...`, "color: #f59e0b; font-weight: bold; font-size: 1.1em;");
     console.log(`%c[VAD] Settings: Batch=${batchSizeSec}s | MinSilence=${minSilenceSec}s | Threshold=${silenceThreshold} | Filter=${filteringEnabled}`, "color: #60a5fa");
 
     const BATCH_SAMPLES = batchSizeSec * sampleRate;
@@ -412,6 +463,7 @@ function* getVADChunks(
     let globalIndex = 0;
     
     // Buffer to hold audio that needs processing (including carried over audio)
+    // IMPORTANT: Re-initialized here, ensuring no cache from previous runs.
     let buffer: Float32Array = new Float32Array(0);
     // Track the global start time of the current buffer
     let bufferGlobalStart = 0;
@@ -426,7 +478,7 @@ function* getVADChunks(
         const batchEnd = Math.min(filePointer + BATCH_SAMPLES, audioData.length);
         const newBatch = audioData.slice(filePointer, batchEnd);
         
-        console.group(`[VAD] Processing Batch ${(filePointer/sampleRate).toFixed(2)}s - ${(batchEnd/sampleRate).toFixed(2)}s`);
+        console.groupCollapsed(`[VAD] Processing Batch ${(filePointer/sampleRate).toFixed(2)}s - ${(batchEnd/sampleRate).toFixed(2)}s`);
         
         // Merge leftover buffer with new batch
         const combined = new Float32Array(buffer.length + newBatch.length);
@@ -440,7 +492,7 @@ function* getVADChunks(
         // --- STEP 2: FILTERING ---
         let analysisBuffer = buffer;
         if (filteringEnabled) {
-            console.log(`Applying Band-Pass Filter (80Hz - 3000Hz)...`);
+            console.log(`Applying Band-Pass Filter (60Hz - 6000Hz)...`);
             analysisBuffer = applyVocalFilter(buffer, sampleRate);
         } else {
             console.log(`Filtering Disabled. Analyzing Raw Audio.`);
@@ -643,6 +695,9 @@ const generateSubtitlesOnline = async (
     const resultsMap: Record<number, SubtitleSegment[]> = {};
     let maxIndexFound = -1;
     
+    // Test Mode: Initialize ZIP
+    const zip = testMode ? new JSZip() : null;
+    
     const updateProgress = () => {
         let allSegments: SubtitleSegment[] = [];
         // Since chunks come in order mostly, but we process in parallel, 
@@ -661,6 +716,16 @@ const generateSubtitlesOnline = async (
     const processChunk = async (chunkDef: ChunkDefinition) => {
         const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
+
+        // --- DEBUG: SAVE CHUNK TO ZIP ---
+        if (testMode && zip) {
+             const startTime = (chunkDef.start / SAMPLE_RATE).toFixed(2);
+             const endTime = (chunkDef.end / SAMPLE_RATE).toFixed(2);
+             const fileName = `chunk_${chunkDef.index.toString().padStart(3, '0')}_${startTime}s-${endTime}s.wav`;
+             zip.file(fileName, wavBuffer);
+        }
+        // ---------------------------------------------------------------------
+
         const base64Audio = await blobToBase64(new Blob([wavBuffer], { type: 'audio/wav' }));
         const timeOffset = chunkDef.start / SAMPLE_RATE;
         const actualDuration = chunkSamples.length / SAMPLE_RATE;
@@ -754,6 +819,11 @@ Include every spoken word. Do not summarize. Do not skip segments. Verbatim tran
         workers.push(worker());
     }
     await Promise.all(workers);
+    
+    // Download ZIP if in Test Mode
+    if (testMode && zip) {
+        await saveDebugZip(zip);
+    }
 
     let finalSegments: SubtitleSegment[] = [];
     // Final pass to ensure everything is collected
@@ -887,6 +957,9 @@ const generateSubtitlesLocalServer = async (
     const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
 
     let allSegments: SubtitleSegment[] = [];
+    
+    // Test Mode: Initialize ZIP
+    const zip = testMode ? new JSZip() : null;
 
     // Local server usually can't handle concurrency well on consumer GPU, so we do sequential
     for (const chunkDef of chunkGenerator) {
@@ -895,6 +968,16 @@ const generateSubtitlesLocalServer = async (
         const chunkDuration = chunkSamples.length / SAMPLE_RATE;
 
         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
+
+        // --- DEBUG: SAVE CHUNK TO ZIP ---
+        if (testMode && zip) {
+             const startTime = chunkStartTime.toFixed(2);
+             const endTime = (chunkDef.end / SAMPLE_RATE).toFixed(2);
+             const fileName = `chunk_${chunkDef.index.toString().padStart(3, '0')}_${startTime}s-${endTime}s.wav`;
+             zip.file(fileName, wavBuffer);
+        }
+        // ---------------------------------------------------------------------
+
         const audioBlob = new Blob([wavBuffer], { type: 'audio/wav' });
         const file = new File([audioBlob], "chunk.wav", { type: "audio/wav" });
         
@@ -954,6 +1037,10 @@ const generateSubtitlesLocalServer = async (
         } catch (e) {}
     }
 
+    if (testMode && zip) {
+        await saveDebugZip(zip);
+    }
+
     return allSegments.map((s, i) => ({ ...s, id: i }));
 };
 
@@ -1007,25 +1094,43 @@ export const generateSubtitles = async (
         const w = initWorker();
         onSubtitleProgressCallback = onProgress;
         
+        // --- CRITICAL RESET: Ensure we start with a clean slate for this new job ---
         accumulatedSegments = [];
-        activeJobId++;
+        activeJobId++; 
         const jobId = activeJobId;
+        console.log(`[Offline Job] Starting new generation (Job ID: ${jobId}). Cleared previous results.`);
         
         // Determine limit
         const limitSec = testMode ? vadSettings.batchSize : undefined;
 
         // Setup chunk generator
         const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+        
+        // Test Mode: Initialize ZIP
+        const zip = testMode ? new JSZip() : null;
 
         // We'll process chunks sequentially to avoid overloading the worker memory/queue
         try {
             if (onStatus) onStatus("Running AI Model...");
             for (const chunkDef of chunkGenerator) {
                 // Check if job cancelled (simple check: if activeJobId changed)
-                if (jobId !== activeJobId) break;
+                if (jobId !== activeJobId) {
+                    console.log(`[Offline Job] Job ID ${jobId} cancelled by newer request.`);
+                    break;
+                }
 
                 const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
                 const timeOffset = chunkDef.start / SAMPLE_RATE;
+
+                // --- DEBUG: SAVE CHUNK TO ZIP ---
+                if (testMode && zip) {
+                        const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
+                        const startTime = timeOffset.toFixed(2);
+                        const endTime = (chunkDef.end / SAMPLE_RATE).toFixed(2);
+                        const fileName = `chunk_${chunkDef.index.toString().padStart(3, '0')}_${startTime}s-${endTime}s.wav`;
+                        zip.file(fileName, wavBuffer);
+                }
+                // ---------------------------------------------------------------------
 
                 // Create a promise for this specific chunk
                 await new Promise<void>((chunkResolve, chunkReject) => {
@@ -1050,6 +1155,11 @@ export const generateSubtitles = async (
                     });
                 });
             }
+            
+            if (testMode && zip) {
+                await saveDebugZip(zip);
+            }
+
             resolve(accumulatedSegments);
         } catch (e) {
             reject(e);
