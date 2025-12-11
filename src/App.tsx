@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Disc, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink, Square } from 'lucide-react';
+import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink, Square } from 'lucide-react';
 import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from './types';
 import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData, cancelSubtitleGeneration } from './services/geminiService';
 import { VideoControls } from './components/VideoControls';
@@ -1121,7 +1121,7 @@ export default function App() {
                 onClick={handleLoadVideoClick}
                 className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-sm font-medium rounded-lg cursor-pointer transition-colors border border-gray-700"
             >
-                <Disc size={16} />
+                <Upload size={16} />
                 <span>Load Video</span>
                 <input type="file" accept=".mp4" onChange={handleFileChange} className="hidden" />
             </label>
@@ -1174,7 +1174,7 @@ export default function App() {
                   onClick={handleLoadVideoClick}
                   className="text-gray-600 flex flex-col items-center cursor-pointer hover:text-gray-400 transition-colors"
               >
-                  <Disc size={48} className="mb-4 opacity-50" />
+                  <Upload size={48} className="mb-4 opacity-50" />
                   <p className="font-medium text-lg">Click to Load Video</p>
                   <p className="text-xs text-gray-500 mt-2">
                      {isOffline ? "Ready for Offline Mode" : "Ready for Online Mode"}

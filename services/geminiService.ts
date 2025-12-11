@@ -70,9 +70,8 @@ self.onmessage = async (event) => {
                 // Run inference on this chunk
                 const output = await transcriber(chunk, {
                     language: 'english',
-                    return_timestamps: true,
+                    return_timestamps: true
                 });
-
                 
                 const adjustedChunks = (output.chunks || []).map(c => {
                     const start = (c.timestamp[0] === null ? 0 : c.timestamp[0]) + totalOffset;
@@ -83,7 +82,7 @@ self.onmessage = async (event) => {
                     };
                 });
 
-                // Emit partial results immediately with jobId
+                // Emit partial results immediately (Chunk complete)
                 self.postMessage({ type: 'partial', data: adjustedChunks, jobId });
 
                 offsetSamples += CHUNK_SIZE;
