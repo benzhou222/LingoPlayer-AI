@@ -73,9 +73,25 @@ self.onmessage = async (event) => {
                     return_timestamps: true
                 });
                 
-                const adjustedChunks = (output.chunks || []).map(c => {
-                    const start = (c.timestamp[0] === null ? 0 : c.timestamp[0]) + totalOffset;
+                const adjustedChunks = (output.chunks || []).map((c, idx, arr) => {
+                    // Fix for potential null start timestamp (often happens at the very end of stream)
+                    let startRaw = c.timestamp[0];
+                    if (startRaw === null) {
+                        if (idx > 0 && arr[idx - 1].timestamp[1] !== null) {
+                             startRaw = arr[idx - 1].timestamp[1];
+                        } else {
+                             // Fallback: Check if we have an end time and assume a short duration, or use 0 relative to chunk
+                             if (c.timestamp[1] !== null) {
+                                 startRaw = Math.max(0, c.timestamp[1] - 2.0);
+                             } else {
+                                 startRaw = 0;
+                             }
+                        }
+                    }
+
+                    const start = startRaw + totalOffset;
                     const end = (c.timestamp[1] === null ? start + 2 : c.timestamp[1]) + totalOffset;
+                    
                     return {
                         text: c.text,
                         timestamp: [start, end]
@@ -130,6 +146,11 @@ const initWorker = () => {
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'ready' });
       } 
       else if (type === 'partial') {
+        // --- LOGGING RETURN DATA (WORKER) ---
+        if (data && data.length > 0) {
+            console.log(`%c[Whisper Worker Return] Partial Results:`, "color: #10b981; font-weight: bold;", data);
+        }
+
         // Append new chunks to our local accumulator with filtering
         const rawSegments = (data || []).map((chunk: any) => ({
            id: 0, 
@@ -168,9 +189,9 @@ const initWorker = () => {
                   
                   // Timestamp overlap adjustment
                   if (seg.start < last.end) {
-                      // If overlap is small, adjust start
+                      // If overlap is small, assume it's continuous
                       if (last.end - seg.start < 0.5) {
-                          seg.start = last.end;
+                          // No-op here, we will fix overlaps in the final sort pass
                       } 
                       // If overlap is large or contained, check content length
                       else if (seg.end <= last.end) {
@@ -192,9 +213,14 @@ const initWorker = () => {
         if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
       }
       else if (type === 'complete') {
+        console.log(`%c[Whisper Worker Return] Chunk Complete. Total Segments so far: ${accumulatedSegments.length}`, "color: #10b981; font-weight: bold;");
+        // Ensure final sort and cleanup
+        accumulatedSegments.sort((a, b) => a.start - b.start);
+        accumulatedSegments = accumulatedSegments.map((s, i) => ({ ...s, id: i }));
         if (onSubtitleProgressCallback) onSubtitleProgressCallback(accumulatedSegments);
       } 
       else if (type === 'error') {
+        console.error("[Whisper Worker] Error:", data);
         if (onLoadProgressCallback) onLoadProgressCallback({ status: 'error', error: data });
         if (!data.file && typeof data === 'string') alert("Offline AI Error: " + data); 
       }
@@ -372,19 +398,37 @@ function detectTimeScale(segments: any[], chunkDuration: number): number {
     const validCandidates = candidates.filter(scale => {
         const scaledAvg = avgDur * scale;
         const scaledMax = maxEnd * scale;
-        const isDurationReasonable = scaledAvg >= 0.2 && scaledAvg <= 30.0;
+        // Relaxed constraints to catch edge cases
+        const isDurationReasonable = scaledAvg >= 0.1 && scaledAvg <= 60.0;
         const fitsInChunk = scaledMax <= (chunkDuration * 1.5);
         return isDurationReasonable && fitsInChunk;
     });
 
     if (validCandidates.length === 1) return validCandidates[0];
+    
+    // If multiple candidates, we sort by which one results in an average duration closest to 3.0s.
+    // KEY FIX: Use logarithmic difference instead of linear difference.
+    // This prevents long sentences (e.g. 6s) from being rejected in favor of tiny ones (0.6s)
+    // just because 0.6 is linearly closer to 3.0 than 6.0 is.
+    // In log scale: 3.0/0.6 = 5x diff. 6.0/3.0 = 2x diff. So 6.0 wins (correctly).
     if (validCandidates.length > 1) {
         return validCandidates.sort((a, b) => {
-            const distA = Math.abs((avgDur * a) - 3.0);
-            const distB = Math.abs((avgDur * b) - 3.0);
+            const valA = avgDur * a;
+            const valB = avgDur * b;
+            
+            // Prevent log(0)
+            const logA = Math.log(Math.max(0.0001, valA));
+            const logB = Math.log(Math.max(0.0001, valB));
+            const target = Math.log(3.0);
+            
+            const distA = Math.abs(logA - target);
+            const distB = Math.abs(logB - target);
+            
             return distA - distB;
         })[0];
     }
+
+    // Fallback: Fits best in chunk duration
     return candidates.sort((a, b) => {
          const distA = Math.abs((maxEnd * a) - chunkDuration);
          const distB = Math.abs((maxEnd * b) - chunkDuration);
@@ -499,30 +543,27 @@ function* getVADChunks(
     filteringEnabled: boolean, 
     limitSec?: number
 ): Generator<ChunkDefinition> {
-    console.log(`%c[VAD] Fresh Start - Clearing state and re-scanning...`, "color: #f59e0b; font-weight: bold; font-size: 1.1em;");
-    console.log(`%c[VAD] Settings: Batch=${batchSizeSec}s | MinSilence=${minSilenceSec}s | Threshold=${silenceThreshold} | Filter=${filteringEnabled}`, "color: #60a5fa");
+    
+    // Removed Verbose Logs for Clean Output
+    // console.log(`%c[VAD] Start Processing Audio...`);
 
     const BATCH_SAMPLES = batchSizeSec * sampleRate;
     let filePointer = 0;
     let globalIndex = 0;
     
     // Buffer to hold audio that needs processing (including carried over audio)
-    // IMPORTANT: Re-initialized here, ensuring no cache from previous runs.
     let buffer: Float32Array = new Float32Array(0);
     // Track the global start time of the current buffer
     let bufferGlobalStart = 0;
 
     while (filePointer < audioData.length) {
         if (limitSec !== undefined && (filePointer / sampleRate) >= limitSec) {
-             console.log(`%c[VAD] Test Limit (${limitSec}s) reached. Stopping.`, "color: orange");
              break;
         }
 
         // --- STEP 1: PRE-SPLIT (Batching) ---
         const batchEnd = Math.min(filePointer + BATCH_SAMPLES, audioData.length);
         const newBatch = audioData.slice(filePointer, batchEnd);
-        
-        console.groupCollapsed(`[VAD] Processing Batch ${(filePointer/sampleRate).toFixed(2)}s - ${(batchEnd/sampleRate).toFixed(2)}s`);
         
         // Merge leftover buffer with new batch
         const combined = new Float32Array(buffer.length + newBatch.length);
@@ -531,21 +572,14 @@ function* getVADChunks(
         buffer = combined;
         // bufferGlobalStart is already correct (points to start of leftover)
         
-        console.log(`Buffer size: ${(buffer.length/sampleRate).toFixed(2)}s (Leftover + New Batch)`);
-
         // --- STEP 2: FILTERING ---
         let analysisBuffer = buffer;
         if (filteringEnabled) {
-            console.log(`Applying Band-Pass Filter (60Hz - 6000Hz)...`);
             analysisBuffer = applyVocalFilter(buffer, sampleRate);
-        } else {
-            console.log(`Filtering Disabled. Analyzing Raw Audio.`);
         }
 
         // --- STEP 3: VAD SCAN ---
-        console.log(`Scanning for silence (Threshold: ${silenceThreshold}, Min: ${minSilenceSec}s)...`);
         const splitIndices = scanForSplitPoints(analysisBuffer, sampleRate, minSilenceSec, silenceThreshold);
-        console.log(`Found ${splitIndices.length} split points.`);
 
         // --- STEP 4: YIELD CHUNKS ---
         let lastSplitLocal = 0;
@@ -561,15 +595,11 @@ function* getVADChunks(
                 const globalStart = bufferGlobalStart + startLocal;
                 const globalEnd = bufferGlobalStart + endLocal;
                 
-                console.log(`Yielding Chunk #${globalIndex}: ${globalStart/sampleRate}s -> ${globalEnd/sampleRate}s (${dur.toFixed(2)}s)`);
-                
                 yield {
                     index: globalIndex++,
                     start: globalStart,
                     end: globalEnd
                 };
-            } else {
-                console.debug(`Skipping micro-chunk (<0.2s): ${dur.toFixed(3)}s`);
             }
             
             lastSplitLocal = endLocal;
@@ -587,7 +617,7 @@ function* getVADChunks(
             if (leftoverSamples > 0) {
                  const globalStart = bufferGlobalStart + lastSplitLocal;
                  const globalEnd = bufferGlobalStart + buffer.length;
-                 console.log(`EOF: Flushing final chunk: ${globalStart/sampleRate}s -> ${globalEnd/sampleRate}s`);
+                 
                  yield {
                     index: globalIndex++,
                     start: globalStart,
@@ -597,12 +627,9 @@ function* getVADChunks(
             buffer = new Float32Array(0);
         } else {
             // Check if buffer is getting dangerously large (no silence found)
-            // e.g., if buffer > 3 * batchSize, we must cut forcefully to avoid memory issues or hanging
             const MAX_BUFFER_SAMPLES = BATCH_SAMPLES * 3;
             
             if (leftoverSamples > MAX_BUFFER_SAMPLES) {
-                console.warn(`%cBuffer too large (${(leftoverSamples/sampleRate).toFixed(2)}s) without silence! Forcing split.`, "color: red");
-                
                 const globalStart = bufferGlobalStart + lastSplitLocal;
                 const globalEnd = bufferGlobalStart + buffer.length;
                 
@@ -614,21 +641,17 @@ function* getVADChunks(
                 
                 // Reset buffer completely
                 buffer = new Float32Array(0);
-                // The next buffer start will be exactly where we just ended (which is the current batchEnd)
                 bufferGlobalStart = batchEnd; 
             } else {
                 // Normal carry over
-                console.log(`Carrying over ${(leftoverSamples/sampleRate).toFixed(2)}s to next batch.`);
                 buffer = buffer.slice(lastSplitLocal);
                 bufferGlobalStart = bufferGlobalStart + lastSplitLocal;
             }
         }
         
-        console.groupEnd();
         filePointer = batchEnd;
         if (isLimitReached) break;
     }
-    console.log(`%c[VAD] Completed. Total Chunks: ${globalIndex}`, "color: #4ade80; font-weight: bold;");
 }
 
 // Split Audio using Fixed Progressive Schedule (Generator Version)
@@ -731,11 +754,22 @@ const generateSubtitlesOnline = async (
 
     const SAMPLE_RATE = 16000;
     
-    // Determine limit
-    const limitSec = testMode ? vadSettings.batchSize : undefined;
+    let chunksToProcess: ChunkDefinition[];
 
-    // Get chunks generator
-    const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+    if (testMode) {
+        // "Pre-segmentation" last chunk: Raw batch from end of file
+        const batchSamples = vadSettings.batchSize * SAMPLE_RATE;
+        const start = Math.max(0, audioData.length - batchSamples);
+        chunksToProcess = [{
+            index: 0,
+            start: start,
+            end: audioData.length
+        }];
+         if (onStatus) onStatus(`Test Mode: Processing last raw batch (${(start/SAMPLE_RATE).toFixed(1)}s - ${(audioData.length/SAMPLE_RATE).toFixed(1)}s)...`);
+    } else {
+        const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, undefined);
+        chunksToProcess = Array.from(chunkGenerator);
+    }
 
     const resultsMap: Record<number, SubtitleSegment[]> = {};
     let maxIndexFound = -1;
@@ -747,7 +781,10 @@ const generateSubtitlesOnline = async (
         let allSegments: SubtitleSegment[] = [];
         // Since chunks come in order mostly, but we process in parallel, 
         // we can iterate up to the max index we have processed so far.
-        for (let i = 0; i <= maxIndexFound; i++) {
+        // If in test mode, we just check the specific indices we processed.
+        const indicesToCheck = testMode ? chunksToProcess.map(c => c.index) : Array.from({length: maxIndexFound + 1}, (_, i) => i);
+        
+        for (const i of indicesToCheck) {
             if (resultsMap[i]) {
                 allSegments = allSegments.concat(resultsMap[i]);
             }
@@ -781,6 +818,8 @@ const generateSubtitlesOnline = async (
         const prompt = `Transcribe the audio exactly. Output valid JSON array: [{ "start": float, "end": float, "text": string }]. 
 Timestamps must be relative to the start of this clip (0.0). 
 Include every spoken word. Do not summarize. Do not skip segments. Verbatim transcription only.`;
+
+        // Removed Sending Log
 
         let attempt = 0;
         const MAX_RETRIES = 3;
@@ -830,6 +869,7 @@ Include every spoken word. Do not summarize. Do not skip segments. Verbatim tran
                 return [];
 
             } catch (e: any) {
+                console.warn(`[Gemini Online] Retry #${attempt + 1} for Chunk #${chunkDef.index} failed.`, e);
                 attempt++;
                 if (attempt >= MAX_RETRIES) return [];
                 const delay = Math.pow(2, attempt - 1) * 1000;
@@ -839,20 +879,16 @@ Include every spoken word. Do not summarize. Do not skip segments. Verbatim tran
         return [];
     };
 
-    if (onStatus) onStatus("Transcribing Segments...");
+    if (onStatus) onStatus(testMode ? "Transcribing Last Segment..." : "Transcribing Segments...");
     onProgress([]);
 
     const CONCURRENCY_LIMIT = 2;
-    
-    // Using a shared iterator for workers allows them to consume chunks as they are yielded by the generator
-    const worker = async () => {
-        while (true) {
-            if (jobId !== undefined && jobId !== activeJobId) break; // Cancellation check
+    const processingIterator = chunksToProcess.values();
 
-            const { value: chunkDef, done } = chunkGenerator.next();
-            if (done) break;
-            
-            if (jobId !== undefined && jobId !== activeJobId) break; // Double check
+    // Using a shared iterator for workers allows them to consume chunks from the filtered list
+    const worker = async () => {
+        for (const chunkDef of processingIterator) {
+            if (jobId !== undefined && jobId !== activeJobId) break; // Cancellation check
 
             // Track max index for UI rendering purposes
             if (chunkDef.index > maxIndexFound) maxIndexFound = chunkDef.index;
@@ -876,9 +912,13 @@ Include every spoken word. Do not summarize. Do not skip segments. Verbatim tran
 
     let finalSegments: SubtitleSegment[] = [];
     // Final pass to ensure everything is collected
-    for (let i = 0; i <= maxIndexFound; i++) {
+    // In test mode, only collect the chunks we processed
+    const finalIndices = testMode ? chunksToProcess.map(c => c.index) : Array.from({length: maxIndexFound + 1}, (_, i) => i);
+    
+    for (const i of finalIndices) {
         if (resultsMap[i]) finalSegments = finalSegments.concat(resultsMap[i]);
     }
+    finalSegments.sort((a, b) => a.start - b.start);
     return finalSegments.map((s, i) => ({ ...s, id: i }));
 };
 
@@ -1000,19 +1040,30 @@ const generateSubtitlesLocalServer = async (
 ): Promise<SubtitleSegment[]> => {
     const SAMPLE_RATE = 16000;
     
-    // Determine limit (PRE-SPLITTING LIMIT)
-    const limitSec = testMode ? vadSettings.batchSize : undefined;
+    let chunksToProcess: ChunkDefinition[];
 
-    // Get chunks generator
-    const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+    if (testMode) {
+        const batchSamples = vadSettings.batchSize * SAMPLE_RATE;
+        const start = Math.max(0, audioData.length - batchSamples);
+        chunksToProcess = [{
+            index: 0,
+            start: start,
+            end: audioData.length
+        }];
+        console.log(`%c[Test VAD] Processing Last Raw Batch: ${start/SAMPLE_RATE}s - ${audioData.length/SAMPLE_RATE}s`, "color: orange; font-weight: bold;");
+    } else {
+        const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, undefined);
+        chunksToProcess = Array.from(chunkGenerator);
+    }
 
     let allSegments: SubtitleSegment[] = [];
     
     // Test Mode: Initialize ZIP
     const zip = testMode ? new JSZip() : null;
+    const lastChunks: { name: string; data: ArrayBuffer }[] = []; 
 
     // Local server usually can't handle concurrency well on consumer GPU, so we do sequential
-    for (const chunkDef of chunkGenerator) {
+    for (const chunkDef of chunksToProcess) {
         if (jobId !== undefined && jobId !== activeJobId) break; // Cancellation check
 
         const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
@@ -1021,17 +1072,21 @@ const generateSubtitlesLocalServer = async (
 
         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
 
-        // --- DEBUG: SAVE CHUNK TO ZIP ---
-        if (testMode && zip) {
+        // --- DEBUG: BUFFER CHUNK (ROLLING 2) ---
+        if (testMode) {
              const startTime = chunkStartTime.toFixed(2);
              const endTime = (chunkDef.end / SAMPLE_RATE).toFixed(2);
              const fileName = `chunk_${chunkDef.index.toString().padStart(3, '0')}_${startTime}s-${endTime}s.wav`;
-             zip.file(fileName, wavBuffer);
+             
+             lastChunks.push({ name: fileName, data: wavBuffer });
+             if (lastChunks.length > 2) lastChunks.shift();
         }
         // ---------------------------------------------------------------------
 
         const audioBlob = new Blob([wavBuffer], { type: 'audio/wav' });
         const file = new File([audioBlob], "chunk.wav", { type: "audio/wav" });
+
+        // Removed Sending Log
         
         const formData = new FormData();
         formData.append('file', file);
@@ -1046,6 +1101,10 @@ const generateSubtitlesLocalServer = async (
 
             if (response.ok) {
                 const data = await response.json();
+                
+                // --- LOGGING RETURN DATA (LOCAL SERVER) ---
+                console.log(`%c[Local Whisper Return] Chunk #${chunkDef.index} Data:`, "color: #10b981; font-weight: bold;", data);
+
                 let rawSegments: any[] = [];
                 
                 if (data.segments && Array.isArray(data.segments)) {
@@ -1057,7 +1116,8 @@ const generateSubtitlesLocalServer = async (
                 }
 
                 if (rawSegments.length > 0) {
-                    const scale = detectTimeScale(rawSegments, chunkDuration);
+                    // Check override first, otherwise auto-detect
+                    const scale = config.timeScale || detectTimeScale(rawSegments, chunkDuration);
                     const chunkSegments: SubtitleSegment[] = rawSegments.map((s: any) => {
                          const startRaw = parseTimestamp(s.start);
                          const endRaw = parseTimestamp(s.end);
@@ -1077,12 +1137,12 @@ const generateSubtitlesLocalServer = async (
                             const cleanSeg = seg.text.toLowerCase().trim();
                             const cleanLast = last.text.toLowerCase().trim();
                             if (cleanSeg.length > 3 && cleanLast.endsWith(cleanSeg)) continue;
-                            if (seg.start < last.end && last.end - seg.start < 1.0) {
-                                seg.start = last.end;
-                            }
+                            // Remove artificial overlap fix here too
                         }
                         if (seg.end > seg.start) allSegments.push(seg);
                     }
+                    
+                    allSegments.sort((a,b) => a.start - b.start);
                     onProgress(allSegments.map((s, i) => ({...s, id: i})));
                 }
             }
@@ -1090,6 +1150,7 @@ const generateSubtitlesLocalServer = async (
     }
 
     if (testMode && zip) {
+        lastChunks.forEach(c => zip.file(c.name, c.data));
         await saveDebugZip(zip);
     }
 
@@ -1122,6 +1183,10 @@ export const generateSubtitles = async (
     activeJobId++;
     const jobId = activeJobId;
     
+    // NEW: Clear logs
+    console.clear(); 
+    console.log("%c[System] Logs cleared. Starting generation...", "color: #a78bfa; font-weight: bold;");
+    
     // Clear accumulation for new run (legacy global var, but used by worker callbacks)
     accumulatedSegments = []; 
 
@@ -1153,19 +1218,31 @@ export const generateSubtitles = async (
         const w = initWorker();
         onSubtitleProgressCallback = onProgress;
         
-        // Determine limit
-        const limitSec = testMode ? vadSettings.batchSize : undefined;
+        let chunksToProcess: ChunkDefinition[];
 
-        // Setup chunk generator
-        const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, limitSec);
+        if (testMode) {
+            const batchSamples = vadSettings.batchSize * SAMPLE_RATE;
+            const start = Math.max(0, audioData.length - batchSamples);
+            chunksToProcess = [{
+                index: 0,
+                start: start,
+                end: audioData.length
+            }];
+             console.log(`%c[Test VAD] Processing Last Raw Batch: ${start/SAMPLE_RATE}s - ${audioData.length/SAMPLE_RATE}s`, "color: orange; font-weight: bold;");
+             if (onStatus) onStatus("Running AI Model on Last Batch (Raw)...");
+        } else {
+            const chunkGenerator = getChunkDefinitions(audioData, SAMPLE_RATE, segmentationMethod, vadSettings, undefined);
+            chunksToProcess = Array.from(chunkGenerator);
+             if (onStatus) onStatus("Running AI Model...");
+        }
         
         // Test Mode: Initialize ZIP
         const zip = testMode ? new JSZip() : null;
+        const lastChunks: { name: string; data: ArrayBuffer }[] = [];
 
         // We'll process chunks sequentially to avoid overloading the worker memory/queue
         try {
-            if (onStatus) onStatus("Running AI Model...");
-            for (const chunkDef of chunkGenerator) {
+            for (const chunkDef of chunksToProcess) {
                 // Check if job cancelled (simple check: if activeJobId changed)
                 if (jobId !== activeJobId) {
                     console.log(`[Offline Job] Job ID ${jobId} cancelled by newer request.`);
@@ -1175,13 +1252,15 @@ export const generateSubtitles = async (
                 const chunkSamples = audioData.slice(chunkDef.start, chunkDef.end);
                 const timeOffset = chunkDef.start / SAMPLE_RATE;
 
-                // --- DEBUG: SAVE CHUNK TO ZIP ---
-                if (testMode && zip) {
+                // --- DEBUG: BUFFER CHUNK (ROLLING 2) ---
+                if (testMode) {
                         const wavBuffer = encodeWAV(chunkSamples, SAMPLE_RATE);
                         const startTime = timeOffset.toFixed(2);
                         const endTime = (chunkDef.end / SAMPLE_RATE).toFixed(2);
                         const fileName = `chunk_${chunkDef.index.toString().padStart(3, '0')}_${startTime}s-${endTime}s.wav`;
-                        zip.file(fileName, wavBuffer);
+                        
+                        lastChunks.push({ name: fileName, data: wavBuffer });
+                        if (lastChunks.length > 2) lastChunks.shift();
                 }
                 // ---------------------------------------------------------------------
 
@@ -1202,6 +1281,8 @@ export const generateSubtitles = async (
                     };
                     w.addEventListener('message', chunkHandler);
                     
+                    // Removed Sending Log (Worker)
+
                     w.postMessage({
                         type: 'generate',
                         data: { audio: chunkSamples, model: modelId, jobId, timeOffset }
@@ -1210,6 +1291,7 @@ export const generateSubtitles = async (
             }
             
             if (testMode && zip) {
+                lastChunks.forEach(c => zip.file(c.name, c.data));
                 await saveDebugZip(zip);
             }
 

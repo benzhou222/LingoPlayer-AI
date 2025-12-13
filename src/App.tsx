@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Upload, BookOpen, ListVideo, X, Trash2, AlertCircle, Loader2, WifiOff, Wifi, ToggleLeft, ToggleRight, Download, CheckCircle2, ChevronDown, Settings, RefreshCw, Check, AlertTriangle, GripVertical, GripHorizontal, Cloud, Server, Mic, Terminal, Scissors, PlayCircle, FlaskConical, FileAudio, ExternalLink, Square } from 'lucide-react';
-import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from './types';
-import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData, cancelSubtitleGeneration } from './services/geminiService';
-import { VideoControls } from './components/VideoControls';
-import { WordDefinitionPanel } from './components/WordDefinitionPanel';
-import { extractAudioAsWav } from './services/converterService';
+import { SubtitleSegment, WordDefinition, VocabularyItem, PlaybackMode, LocalLLMConfig, GeminiConfig, LocalASRConfig, SegmentationMethod, VADSettings } from '../types';
+import { generateSubtitles, getWordDefinition, preloadOfflineModel, setLoadProgressCallback, fetchLocalModels, getAudioData, cancelSubtitleGeneration } from '../services/geminiService';
+import { VideoControls } from '../components/VideoControls';
+import { WordDefinitionPanel } from '../components/WordDefinitionPanel';
+import { extractAudioAsWav } from '../services/converterService';
 
 const OFFLINE_MODELS = [
     { id: 'Xenova/whisper-base', name: 'Base (Multilingual, ~75MB)' },
@@ -86,6 +86,16 @@ export default function App() {
     }
   });
 
+  // Sync Threshold State (New)
+  const [syncThreshold, setSyncThreshold] = useState<number>(() => {
+      try {
+          const saved = localStorage.getItem('lingo_sync_threshold');
+          return saved ? parseInt(saved) : 3;
+      } catch {
+          return 3;
+      }
+  });
+
   // Local LLM State
   const [localLLMConfig, setLocalLLMConfig] = useState<LocalLLMConfig>(() => {
       try {
@@ -129,6 +139,10 @@ export default function App() {
   const processingIdRef = useRef(0);
   const audioDataCacheRef = useRef<Float32Array | null>(null);
 
+  // Seek Authority: 3-Strike Lock Mechanism
+  // Stores the target index, start time, and consecutive successful hits
+  const lockStateRef = useRef<{ index: number; start: number; hits: number } | null>(null);
+
   // --- Settings Persistence ---
   useEffect(() => {
     localStorage.setItem('lingo_local_llm', JSON.stringify(localLLMConfig));
@@ -149,6 +163,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('lingo_vad_settings', JSON.stringify(vadSettings));
   }, [vadSettings]);
+
+  useEffect(() => {
+    localStorage.setItem('lingo_sync_threshold', syncThreshold.toString());
+  }, [syncThreshold]);
 
   // --- Resizing Logic ---
   const startResizingLeft = useCallback(() => {
@@ -284,19 +302,22 @@ export default function App() {
         setLocalASRConfig(p => ({
             ...p,
             endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions',
-            model: 'whisper-large'
+            model: 'whisper-large',
+            timeScale: 0.01
         }));
     } else if (preset === 'whispercpp') {
         setLocalASRConfig(p => ({
             ...p,
             endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions',
-            model: 'whisper-1'
+            model: 'whisper-1',
+            timeScale: 0.01
         }));
     } else if (preset === 'fasterwhisper') {
         setLocalASRConfig(p => ({
             ...p,
             endpoint: 'http://127.0.0.1:8080/v1/audio/transcriptions',
-            model: 'large-v3'
+            model: 'large-v3',
+            timeScale: undefined
         }));
     }
   };
@@ -306,36 +327,10 @@ export default function App() {
      // No blocking here, user can load video anytime
   };
 
-  // --- File Handling ---
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    // Reset player specific state immediately
-    setCurrentTime(0);
-    setDuration(0);
-    setIsPlaying(false);
-    setErrorMsg(null); // Clear previous errors
-    
-    // Clear subtitles when loading new file
-    setSubtitles([]);
-    setCurrentSegmentIndex(-1);
-    
-    // Clear Audio Cache on new file
-    audioDataCacheRef.current = null;
-    
-    // Set video source for the player
-    const url = URL.createObjectURL(file);
-    setVideoSrc(url);
-    
-    // Update file state
-    setVideoFile(file);
-  };
-
   // Handle Manual Generation
-  const handleGenerate = async (testMode: boolean = false) => {
-    // If running, stop it
-    if (isProcessing) {
+  const handleGenerate = async (testMode: boolean = false, fileOverride?: File) => {
+    // If not overriding (manual click) and already processing, treat as STOP command
+    if (!fileOverride && isProcessing) {
         cancelSubtitleGeneration();
         setIsProcessing(false);
         setProcessingStatus('Stopped.');
@@ -344,7 +339,14 @@ export default function App() {
         return;
     }
 
-    if (!videoFile) return;
+    const fileToUse = fileOverride || videoFile;
+    if (!fileToUse) return;
+
+    // If overriding (auto-load), ensure we cancel previous but don't stop the new one
+    if (fileOverride && isProcessing) {
+         cancelSubtitleGeneration();
+         processingIdRef.current += 1;
+    }
 
     const currentId = processingIdRef.current + 1;
     processingIdRef.current = currentId;
@@ -360,6 +362,7 @@ export default function App() {
     setProcessingStatus('Initializing...');
     setErrorMsg(null);
     setIsPlaying(false);
+    lockStateRef.current = null;
 
     // If offline and model not ready and local whisper not enabled
     if (isOffline && !localASRConfig.enabled && modelStatus === 'idle') {
@@ -370,12 +373,17 @@ export default function App() {
         // --- AUDIO CACHING STRATEGY ---
         let audioDataForProcess = audioDataCacheRef.current;
         
+        // If overriding, we must reload audio data for the new file
+        if (fileOverride) {
+            audioDataForProcess = null;
+        }
+
         // If no cache, decode now
         if (!audioDataForProcess) {
              setProcessingStatus('Decoding Audio (Full File)...');
              // We use 'true' for 'forOffline' because we always want raw float32 for caching/VAD, 
              // regardless of mode (Online mode logic will re-encode to WAV if needed inside generateSubtitles)
-             const decoded = await getAudioData(videoFile, true);
+             const decoded = await getAudioData(fileToUse, true);
              if (typeof decoded !== 'string') {
                  audioDataForProcess = decoded;
                  audioDataCacheRef.current = decoded;
@@ -385,7 +393,7 @@ export default function App() {
         }
 
         await generateSubtitles(
-            videoFile, 
+            fileToUse, 
             (newSegments) => {
                 // Only update if this request is still the active one
                 if (processingIdRef.current === currentId) {
@@ -423,6 +431,33 @@ export default function App() {
     }
   };
 
+  // --- File Handling ---
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // Reset player specific state immediately
+    setCurrentTime(0);
+    setDuration(0);
+    setIsPlaying(false);
+    setErrorMsg(null); // Clear previous errors
+    
+    // Clear subtitles when loading new file
+    setSubtitles([]);
+    setCurrentSegmentIndex(-1);
+    
+    // Clear Audio Cache on new file
+    audioDataCacheRef.current = null;
+    lockStateRef.current = null;
+    
+    // Set video source for the player
+    const url = URL.createObjectURL(file);
+    setVideoSrc(url);
+    
+    // Update file state
+    setVideoFile(file);
+  };
+
   // --- Video Logic ---
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
@@ -430,41 +465,120 @@ export default function App() {
     }
   };
 
-  const handleTimeUpdate = () => {
-    if (!videoRef.current) return;
-    const time = videoRef.current.currentTime;
-    setCurrentTime(time);
+  // REAL-TIME SYNC LOOP
+  useEffect(() => {
+    let animationFrameId: number;
 
-    // FIX: Partial/Looping Logic
-    // If in loop mode, ensure we stay within the segment bounds strictly
-    if (playbackMode === PlaybackMode.LOOP_SENTENCE && currentSegmentIndex !== -1) {
-      const segment = subtitles[currentSegmentIndex];
-      if (segment && time >= segment.end) {
-        videoRef.current.currentTime = segment.start;
-        // Do not proceed to find next index to prevent skipping
-        return;
+    const updateLoop = () => {
+      if (videoRef.current && !videoRef.current.paused) {
+        const time = videoRef.current.currentTime;
+        setCurrentTime(time);
+        
+        // --- 1. Loop Mode Enforcement ---
+        if (playbackMode === PlaybackMode.LOOP_SENTENCE && currentSegmentIndex !== -1) {
+            const segment = subtitles[currentSegmentIndex];
+            if (segment && time >= segment.end) {
+                videoRef.current.currentTime = segment.start;
+                setCurrentTime(segment.start);
+                animationFrameId = requestAnimationFrame(updateLoop);
+                return;
+            }
+        }
+
+        // --- 2. Lock / Debounce Logic ---
+        // If a lock is active, we check if we can release it
+        if (lockStateRef.current) {
+            const { index, start } = lockStateRef.current;
+            
+            // "Until the playback time is > start continuously for N reads"
+            // We use a small epsilon 0.001 to handle float precision
+            if (time > (start + 0.001)) {
+                 lockStateRef.current.hits += 1;
+            } else {
+                 // Reset if it drops back (e.g. ghost time or loop)
+                 lockStateRef.current.hits = 0;
+            }
+
+            // Check if threshold met (DYNAMIC THRESHOLD)
+            if (lockStateRef.current.hits >= syncThreshold) {
+                 // Unlock: Release control to normal logic below
+                 lockStateRef.current = null;
+            } else {
+                 // Locked: Force the UI to the locked index
+                 if (currentSegmentIndex !== index) {
+                     setCurrentSegmentIndex(index);
+                 }
+                 // Skip normal logic
+                 animationFrameId = requestAnimationFrame(updateLoop);
+                 return; 
+            }
+        }
+
+        // --- 3. Normal Highlight Logic (Unlocked) ---
+        // FIX: In Sentence Loop Mode, we only allow manual changes (via seek/click).
+        // We prevent automatic detection from overriding the current segment index
+        // because detecting "start of new segment" often overlaps with "end of previous",
+        // causing context switches that break the loop.
+        const shouldAutoUpdate = playbackMode !== PlaybackMode.LOOP_SENTENCE || currentSegmentIndex === -1;
+
+        if (shouldAutoUpdate) {
+            const exactIndex = subtitles.findIndex(s => time >= s.start && time < s.end);
+            
+            if (exactIndex !== -1) {
+                 if (exactIndex !== currentSegmentIndex) {
+                     setCurrentSegmentIndex(exactIndex);
+                 }
+            } else {
+                // Gap handling: If outside any segment, clear highlight
+                if (currentSegmentIndex !== -1) {
+                    setCurrentSegmentIndex(-1);
+                }
+            }
+        }
       }
+      animationFrameId = requestAnimationFrame(updateLoop);
+    };
+
+    if (isPlaying) {
+        updateLoop();
+    } else {
+        cancelAnimationFrame(animationFrameId);
     }
 
-    // Find current subtitle (Standard logic)
-    const index = subtitles.findIndex(sub => time >= sub.start && time < sub.end);
-    if (index !== -1 && index !== currentSegmentIndex) {
-      setCurrentSegmentIndex(index);
-    }
-  };
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [isPlaying, subtitles, currentSegmentIndex, playbackMode, syncThreshold]);
 
   const handleSeek = (time: number) => {
     if (videoRef.current) {
       videoRef.current.currentTime = time;
       setCurrentTime(time);
+      // Manually seeking clears any automatic locks
+      lockStateRef.current = null;
+      
+      const exactIndex = subtitles.findIndex(s => time >= s.start && time < s.end);
+      // FIX: Always update the index when seeking manually, even if it's -1 (gap).
+      // This ensures that if the user seeks away from a looping segment into a gap,
+      // the loop logic disengages instead of snapping back.
+      setCurrentSegmentIndex(exactIndex);
     }
   };
 
   const jumpToSegment = (index: number) => {
     if (!videoRef.current || !subtitles[index]) return;
     const segment = subtitles[index];
-    videoRef.current.currentTime = segment.start;
+    
+    // Set the lock immediately
+    lockStateRef.current = {
+        index: index,
+        start: segment.start,
+        hits: 0
+    };
+    
     setCurrentSegmentIndex(index);
+    // Seek slightly into the segment to avoid boundary issues
+    videoRef.current.currentTime = segment.start + 0.001;
+    setCurrentTime(segment.start);
+
     if (!isPlaying) {
         videoRef.current.play();
         setIsPlaying(true);
@@ -612,6 +726,31 @@ export default function App() {
                     </button>
                 </div>
                 
+                {/* GLOBAL: SUBTITLE SYNC SETTINGS */}
+                <div className="mb-6 border-b border-gray-800 pb-6">
+                     <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 mb-3">
+                        <ListVideo size={14} /> Subtitle Synchronization
+                    </h4>
+                    <div className="px-1">
+                        <div className="flex justify-between items-center mb-1">
+                            <label className="text-xs font-bold text-gray-500 uppercase">Lock Stability Threshold</label>
+                            <span className="text-xs text-blue-400 font-mono">{syncThreshold} Frames</span>
+                        </div>
+                        <input 
+                            type="range" 
+                            min="1" 
+                            max="30" 
+                            step="1"
+                            value={syncThreshold}
+                            onChange={(e) => setSyncThreshold(parseInt(e.target.value))}
+                            className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                        />
+                        <p className="text-[10px] text-gray-500 mt-1">
+                            Number of consecutive frames the timestamp must exceed the target start time before unlocking cursor control. Increase if you see the cursor jumping back.
+                        </p>
+                    </div>
+                </div>
+
                 {/* GLOBAL: AUDIO SEGMENTATION SETTINGS */}
                 <div className="mb-8 border-b border-gray-800 pb-6">
                      <h4 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2 pb-2 mb-3">
@@ -774,7 +913,7 @@ export default function App() {
                                     </p>
                                 </div>
                                 
-                                <div>
+                                <div className="mb-3">
                                     <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Model Name</label>
                                     <input 
                                         type="text" 
@@ -785,6 +924,29 @@ export default function App() {
                                     />
                                     <p className="text-[10px] text-gray-500 mt-2">
                                         Server-side model identifier (e.g. large-v3).
+                                    </p>
+                                </div>
+
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Timestamp Time Scale</label>
+                                    <div className="relative">
+                                        <select 
+                                            value={localASRConfig.timeScale ?? 0}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                setLocalASRConfig(p => ({...p, timeScale: val === 0 ? undefined : val}))
+                                            }}
+                                            className="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none appearance-none cursor-pointer"
+                                        >
+                                            <option value={0}>Auto Detect (Default)</option>
+                                            <option value={1.0}>Seconds (1.0s)</option>
+                                            <option value={0.01}>Centiseconds (0.01s) - Whisper.cpp / LocalAI</option>
+                                            <option value={0.001}>Milliseconds (0.001s)</option>
+                                        </select>
+                                        <ChevronDown size={14} className="absolute right-3 top-3 text-gray-500 pointer-events-none" />
+                                    </div>
+                                    <p className="text-[10px] text-gray-500 mt-2">
+                                        Manually override if timestamps are incorrect.
                                     </p>
                                 </div>
 
@@ -1075,8 +1237,10 @@ export default function App() {
                 <div
                     key={sub.id}
                     onClick={() => jumpToSegment(idx)}
-                    className={`p-4 border-b border-gray-800 cursor-pointer transition-all hover:bg-gray-800 ${
-                    currentSegmentIndex === idx ? 'bg-blue-900/20 border-l-4 border-l-blue-500' : 'border-l-4 border-l-transparent'
+                    className={`p-4 border-b border-gray-800 cursor-pointer transition-all duration-200 hover:bg-gray-800 ${
+                    currentSegmentIndex === idx 
+                        ? 'bg-blue-900/30 border-l-4 border-l-blue-500 scale-[1.02] shadow-lg shadow-black/50 z-10 rounded-r' 
+                        : 'border-l-4 border-l-transparent text-gray-400 opacity-80 hover:opacity-100'
                     }`}
                 >
                     <div className="flex justify-between mb-1">
@@ -1160,7 +1324,6 @@ export default function App() {
                 src={videoSrc}
                 className="w-full h-full object-contain"
                 onClick={togglePlayPause}
-                onTimeUpdate={handleTimeUpdate}
                 onLoadedMetadata={handleLoadedMetadata}
                 onEnded={() => setIsPlaying(false)}
                 onError={(e) => {

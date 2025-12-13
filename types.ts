@@ -34,6 +34,7 @@ export interface LocalASRConfig {
   enabled: boolean;
   endpoint: string;
   model: string;
+  timeScale?: number; // Optional: 1.0 (sec), 0.01 (cs), 0.001 (ms). If undefined, auto-detect.
 }
 
 export interface GeminiConfig {
